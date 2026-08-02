@@ -1,0 +1,6 @@
+FROM docker.io/library/debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl dnsutils socat \
+    && socat -hh 2>&1 | grep -q SOCKS5-CONNECT \
+    && rm -rf /var/lib/apt/lists/*

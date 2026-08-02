@@ -24,5 +24,5 @@ mode = "limited"
 
 "github.com" = "allow"
 "gvisor.dev" = "allow"
-"crates.io" = "allow"
+"**.crates.io" = "allow"
 "docs.rs" = "allow"

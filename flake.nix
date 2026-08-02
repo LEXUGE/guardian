@@ -13,7 +13,7 @@
       flake-utils,
       ...
     }:
-    flake-utils.lib.eachDefaultSystem (
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
       system:
       let
         overlays = [ (import rust-overlay) ];
@@ -30,7 +30,14 @@
               pkg-config
               eza
               fd
-              rust-bin.stable.latest.default
+              gvisor
+              podman
+              (rust-bin.stable.latest.default.override {
+                extensions = [
+                  "rust-src"
+                  "rust-analyzer"
+                ];
+              })
             ];
 
             shellHook = ''
