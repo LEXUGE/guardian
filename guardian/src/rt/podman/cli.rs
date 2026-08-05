@@ -50,6 +50,10 @@ impl Cli {
                 args.push(OsString::from("--mount"));
                 args.push(mount.clone());
             }
+            for volume in spec.user_volumes {
+                args.push(OsString::from("--volume"));
+                args.push(volume.clone());
+            }
             args.extend(
                 spec.env
                     .iter()
@@ -203,6 +207,7 @@ pub(super) struct Create<'a> {
     pub sandbox_id: Uuid,
     pub mounts: &'a [String],
     pub user_mounts: &'a [OsString],
+    pub user_volumes: &'a [OsString],
     pub env: &'a [String],
     pub image: &'a str,
     pub command: &'a [OsString],

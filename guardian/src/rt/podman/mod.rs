@@ -48,6 +48,7 @@ pub struct Config {
 pub struct Spec {
     pub name: Option<String>,
     pub mounts: Vec<OsString>,
+    pub volumes: Vec<OsString>,
     pub image: String,
     pub command: Vec<OsString>,
     pub tty: bool,
@@ -145,6 +146,7 @@ impl rt::Backend for Podman {
                 sandbox_id: id,
                 mounts: &mounts,
                 user_mounts: &spec.mounts,
+                user_volumes: &spec.volumes,
                 env: &env,
                 image: &spec.image,
                 command: &spec.command,
@@ -525,6 +527,7 @@ mod tests {
             .create(Spec {
                 name: None,
                 mounts: vec![OsString::from("type=volume,destination=/workspace,ro")],
+                volumes: vec![OsString::from("cache:/cache:ro")],
                 image: "example/image".into(),
                 command: vec![OsString::from("command")],
                 tty: false,
@@ -581,6 +584,11 @@ mod tests {
                 .lines()
                 .any(|command| command.contains("--mount type=volume,destination=/workspace,ro"))
         );
+        assert!(
+            commands
+                .lines()
+                .any(|command| command.contains("--volume cache:/cache:ro"))
+        );
         assert_eq!(
             commands
                 .lines()
@@ -620,6 +628,7 @@ mod tests {
             .create(Spec {
                 name: None,
                 mounts: Vec::new(),
+                volumes: Vec::new(),
                 image: "example/image".into(),
                 command: vec![OsString::from("command")],
                 tty: false,
@@ -685,6 +694,7 @@ mod tests {
             .create(Spec {
                 name: None,
                 mounts: vec![OsString::from("type=volume,destination=/readonly,ro")],
+                volumes: Vec::new(),
                 image: "alpine:3.23.5".into(),
                 command: vec![
                     OsString::from("sh"),

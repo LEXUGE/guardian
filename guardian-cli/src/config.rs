@@ -122,6 +122,10 @@ pub struct CreateArgs {
     #[arg(long = "mount", value_name = "TYPE-SPECIFIC-OPTIONS")]
     pub mounts: Vec<OsString>,
 
+    /// Podman volume specification. May be repeated.
+    #[arg(long = "volume", value_name = "VOLUME-SPEC")]
+    pub volumes: Vec<OsString>,
+
     /// OCI image name or ID.
     pub image: String,
 
@@ -151,6 +155,7 @@ impl CreateArgs {
         podman::Spec {
             name: self.name,
             mounts: self.mounts,
+            volumes: self.volumes,
             image: self.image,
             command: self.command,
             tty: self.tty,
@@ -196,6 +201,30 @@ mod tests {
             [
                 OsString::from("type=bind,source=./workspace,destination=/workspace"),
                 OsString::from("type=volume,destination=/cache,ro")
+            ]
+        );
+    }
+
+    #[test]
+    fn volumes_are_repeatable() {
+        let cli = Cli::try_parse_from([
+            "guardian",
+            "run",
+            "--volume",
+            "cache:/cache:ro",
+            "--volume",
+            "./workspace:/workspace",
+            "image",
+        ])
+        .unwrap();
+        let Command::Run { create, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            create.volumes,
+            [
+                OsString::from("cache:/cache:ro"),
+                OsString::from("./workspace:/workspace")
             ]
         );
     }
