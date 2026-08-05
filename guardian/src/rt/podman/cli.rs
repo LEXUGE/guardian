@@ -5,14 +5,16 @@ use std::{
     time::Duration,
 };
 
+use serde::Deserialize;
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
-use super::Status;
+use super::{HostUds, Status};
 use crate::{Error, Result};
 
 const MANAGED_LABEL: &str = "io.guardian.managed=true";
-const SANDBOX_LABEL: &str = "io.guardian.sandbox";
+const SANDBOX_ID_LABEL: &str = "io.guardian.sandbox.id";
+const HOST_UDS_LABEL: &str = "io.guardian.sandbox.host-uds";
 
 #[derive(Debug, Clone)]
 pub(super) struct Cli {
@@ -31,7 +33,8 @@ impl Cli {
                 OsString::from("create"),
                 OsString::from(format!("--name={}", spec.name)),
                 OsString::from(format!("--label={MANAGED_LABEL}")),
-                OsString::from(format!("--label={SANDBOX_LABEL}={}", spec.sandbox_id)),
+                OsString::from(format!("--label={SANDBOX_ID_LABEL}={}", spec.sandbox_id)),
+                OsString::from(format!("--label={HOST_UDS_LABEL}={}", spec.host_uds)),
                 OsString::from("--network=none"),
                 OsString::from("--init"),
                 OsString::from("--http-proxy=false"),
@@ -62,7 +65,7 @@ impl Cli {
 
         let output = self
             .podman()
-            .args(self.rt_args())
+            .args(self.rt_args(spec.host_uds))
             .args(create_args(spec))
             .output()
             .await?;
@@ -77,8 +80,8 @@ impl Cli {
         Ok(id)
     }
 
-    pub async fn get(&self, id: Uuid) -> Result<String> {
-        let label = format!("label={SANDBOX_LABEL}={id}");
+    pub async fn get(&self, id: Uuid) -> Result<Container> {
+        let label = format!("label={SANDBOX_ID_LABEL}={id}");
         let output = self
             .podman()
             .args([
@@ -87,23 +90,22 @@ impl Cli {
                 "--no-trunc",
                 "--filter=label=io.guardian.managed=true",
                 &format!("--filter={label}"),
-                "--format={{.ID}}",
+                "--format=json",
             ])
             .output()
             .await?;
         output.check()?;
-
-        let output = String::from_utf8_lossy(&output.stdout);
-        let mut containers = output.lines().filter(|line| !line.trim().is_empty());
+        let mut containers: Vec<Container> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| Error::Podman(format!("invalid container list: {error}")))?;
         let container = containers
-            .next()
+            .pop()
             .ok_or_else(|| Error::Podman(format!("sandbox {id} does not exist")))?;
-        if containers.next().is_some() {
+        if !containers.is_empty() {
             return Err(Error::Podman(format!(
                 "multiple containers use sandbox ID {id}"
             )));
         }
-        Ok(container.trim().to_owned())
+        Ok(container)
     }
 
     pub async fn status(&self, id: &str) -> Result<Status> {
@@ -130,9 +132,9 @@ impl Cli {
         }
     }
 
-    pub fn start(&self, id: &str, inherit: bool) -> Result<Child> {
+    pub fn start(&self, id: &str, inherit: bool, host_uds: HostUds) -> Result<Child> {
         let mut command = self.podman();
-        command.args(self.rt_args()).args([
+        command.args(self.rt_args(host_uds)).args([
             "start",
             "--attach",
             "--interactive",
@@ -181,12 +183,12 @@ impl Cli {
             .check()
     }
 
-    fn rt_args(&self) -> Vec<OsString> {
+    fn rt_args(&self, host_uds: HostUds) -> Vec<OsString> {
         vec![
             OsString::from("--runtime"),
             self.runtime.as_os_str().to_owned(),
             OsString::from("--runtime-flag=network=none"),
-            OsString::from("--runtime-flag=host-uds=open"),
+            OsString::from(format!("--runtime-flag=host-uds={host_uds}")),
             OsString::from("--runtime-flag=ignore-cgroups"),
         ]
     }
@@ -205,6 +207,23 @@ pub(super) struct Create<'a> {
     pub image: &'a str,
     pub command: &'a [OsString],
     pub tty: bool,
+    pub host_uds: HostUds,
+}
+
+#[derive(Deserialize)]
+pub(super) struct Container {
+    #[serde(rename = "Id")]
+    pub container_id: String,
+    #[serde(rename = "Labels")]
+    pub labels: Labels,
+}
+
+#[derive(Deserialize)]
+pub(super) struct Labels {
+    #[serde(rename = "io.guardian.sandbox.id")]
+    pub id: Uuid,
+    #[serde(rename = "io.guardian.sandbox.host-uds", default)]
+    pub host_uds: HostUds,
 }
 
 trait OutputExt {
@@ -221,5 +240,36 @@ impl OutputExt for Output {
             "command failed (status {}): {stderr}",
             self.status
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn get_deserializes_sandbox_labels() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("podman");
+        fs::write(
+            &binary,
+            "#!/bin/sh\necho '[{\"Id\":\"container-id\",\"Labels\":{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\",\"io.guardian.sandbox.host-uds\":\"none\",\"other.label\":\"ignored\"}}]'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let container = Cli::new(binary, "runsc".into())
+            .get(Uuid::new_v4())
+            .await
+            .unwrap();
+
+        assert_eq!(container.container_id, "container-id");
+        assert_eq!(
+            container.labels.id,
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+        );
+        assert_eq!(container.labels.host_uds, HostUds::None);
     }
 }

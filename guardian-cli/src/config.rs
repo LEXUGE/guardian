@@ -133,6 +133,10 @@ pub struct CreateArgs {
     #[arg(long, default_value = "1.1.1.1")]
     pub upstream_dns: Ipv4Addr,
 
+    /// Guest networking through Guardian.
+    #[arg(long, default_value_t = podman::HostUds::Open)]
+    pub network: podman::HostUds,
+
     /// Command and arguments. Defaults to /bin/sh.
     #[arg(
         trailing_var_arg = true,
@@ -151,6 +155,7 @@ impl CreateArgs {
             command: self.command,
             tty: self.tty,
             upstream_dns: self.upstream_dns,
+            host_uds: self.network,
         }
     }
 }
@@ -193,5 +198,20 @@ mod tests {
                 OsString::from("type=volume,destination=/cache,ro")
             ]
         );
+    }
+
+    #[test]
+    fn network_accepts_none_and_defaults_to_open() {
+        let default = Cli::try_parse_from(["guardian", "create", "image"]).unwrap();
+        let Command::Create(default) = default.command else {
+            panic!("expected create command");
+        };
+        assert_eq!(default.network, podman::HostUds::Open);
+
+        let none = Cli::try_parse_from(["guardian", "create", "--network=none", "image"]).unwrap();
+        let Command::Create(none) = none.command else {
+            panic!("expected create command");
+        };
+        assert_eq!(none.network, podman::HostUds::None);
     }
 }

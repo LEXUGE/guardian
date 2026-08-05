@@ -4,10 +4,12 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::{ExitCode, ExitStatus},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
+use serde::Deserialize;
 use tokio::{
     io::{self, AsyncWriteExt},
     process::Child,
@@ -50,6 +52,36 @@ pub struct Spec {
     pub command: Vec<OsString>,
     pub tty: bool,
     pub upstream_dns: Ipv4Addr,
+    pub host_uds: HostUds,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HostUds {
+    #[default]
+    None,
+    Open,
+}
+
+impl fmt::Display for HostUds {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::None => "none",
+            Self::Open => "open",
+        })
+    }
+}
+
+impl FromStr for HostUds {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "open" => Ok(Self::Open),
+            _ => Err(format!("unsupported host UDS mode {value:?}")),
+        }
+    }
 }
 
 struct Context {
@@ -98,17 +130,7 @@ impl rt::Backend for Podman {
                 source.display()
             )
         });
-        let env = vec![
-            "ALL_PROXY=socks5h://127.0.0.1:1080".into(),
-            "all_proxy=socks5h://127.0.0.1:1080".into(),
-            "HTTP_PROXY=socks5h://127.0.0.1:1080".into(),
-            "http_proxy=socks5h://127.0.0.1:1080".into(),
-            "HTTPS_PROXY=socks5h://127.0.0.1:1080".into(),
-            "https_proxy=socks5h://127.0.0.1:1080".into(),
-            "NO_PROXY=127.0.0.1,localhost".into(),
-            "no_proxy=127.0.0.1,localhost".into(),
-            format!("GUARDIAN_UPSTREAM_DNS={}", spec.upstream_dns),
-        ];
+        let env = [format!("GUARDIAN_UPSTREAM_DNS={}", spec.upstream_dns)];
 
         spec.command.insert(0, OsString::from(BOOTSTRAP));
         let name = spec
@@ -127,6 +149,7 @@ impl rt::Backend for Podman {
                 image: &spec.image,
                 command: &spec.command,
                 tty: spec.tty,
+                host_uds: spec.host_uds,
             })
             .await?;
 
@@ -135,15 +158,17 @@ impl rt::Backend for Podman {
             context: Arc::clone(&self.context),
             id,
             container_id,
+            host_uds: spec.host_uds,
         })
     }
 
     async fn get(&self, id: Uuid) -> Result<Self::Sandbox> {
-        let container_id = self.context.cli.get(id).await?;
+        let container = self.context.cli.get(id).await?;
         Ok(Sandbox {
             context: Arc::clone(&self.context),
-            id,
-            container_id,
+            id: container.labels.id,
+            container_id: container.container_id,
+            host_uds: container.labels.host_uds,
         })
     }
 }
@@ -152,6 +177,7 @@ pub struct Sandbox {
     context: Arc<Context>,
     id: Uuid,
     container_id: String,
+    host_uds: HostUds,
 }
 
 impl rt::Sandbox for Sandbox {
@@ -178,9 +204,16 @@ impl rt::Sandbox for Sandbox {
         }
 
         let state = self.context.root.create(Some(self.id))?;
-        let proxy = ProxyTask::spawn(&state.proxy_socket(), self.context.proxy.clone())?;
+        let proxy = ProxyTask::spawn(
+            self.host_uds,
+            &state.proxy_socket(),
+            self.context.proxy.clone(),
+        )?;
         let inherit = matches!(&stdio, Stdio::Inherit);
-        let mut child = self.context.cli.start(&self.container_id, inherit)?;
+        let mut child = self
+            .context
+            .cli
+            .start(&self.container_id, inherit, self.host_uds)?;
         let stdio = StdioTask::spawn(stdio, &mut child);
         let container =
             ContainerTask::spawn(Arc::clone(&self.context), self.container_id.clone(), child);
@@ -423,22 +456,35 @@ impl StdioTask {
     }
 }
 
-struct ProxyTask {
-    shutdown: watch::Sender<bool>,
-    task: JoinHandle<Result<()>>,
+enum ProxyTask {
+    Disabled,
+    Running {
+        shutdown: watch::Sender<bool>,
+        task: JoinHandle<Result<()>>,
+    },
 }
 
 impl ProxyTask {
-    fn spawn(path: &Path, config: uds::Config) -> Result<Self> {
-        let proxy = uds::Proxy::bind(path, config)?;
-        let (shutdown, receiver) = watch::channel(false);
-        let task = tokio::spawn(proxy.run(receiver));
-        Ok(Self { shutdown, task })
+    fn spawn(host_uds: HostUds, path: &Path, config: uds::Config) -> Result<Self> {
+        match host_uds {
+            HostUds::None => Ok(Self::Disabled),
+            HostUds::Open => {
+                let proxy = uds::Proxy::bind(path, config)?;
+                let (shutdown, receiver) = watch::channel(false);
+                let task = tokio::spawn(proxy.run(receiver));
+                Ok(Self::Running { shutdown, task })
+            }
+        }
     }
 
     async fn finish(self) -> Result<()> {
-        drop(self.shutdown);
-        self.task.await?
+        match self {
+            Self::Disabled => Ok(()),
+            Self::Running { shutdown, task } => {
+                drop(shutdown);
+                task.await?
+            }
+        }
     }
 }
 
@@ -483,6 +529,7 @@ mod tests {
                 command: vec![OsString::from("command")],
                 tty: false,
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
+                host_uds: HostUds::Open,
             })
             .await
             .unwrap();
@@ -546,7 +593,83 @@ mod tests {
     }
 
     #[tokio::test]
-    // #[ignore = "requires rootless Podman, runsc, and the guardian-demo image"]
+    async fn missing_host_uds_defaults_to_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("podman");
+        let log = temp.path().join("commands");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    create) echo test-container; exit 0 ;;\n    '--format=json') echo '[{{\"Id\":\"test-container\",\"Labels\":{{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\"}}}}]'; exit 0 ;;\n    '--format={{{{.State}}}}') echo stopped; exit 0 ;;\n    start) cat; exit $? ;;\n  esac\ndone\nexit 1\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut backend = Podman::init(Config {
+            podman: binary,
+            runtime: "runsc".into(),
+            root: temp.path().join("state"),
+            connect_timeout: Duration::from_secs(1),
+            stop_timeout: Duration::from_secs(1),
+        })
+        .await
+        .unwrap();
+        let sandbox = backend
+            .create(Spec {
+                name: None,
+                mounts: Vec::new(),
+                image: "example/image".into(),
+                command: vec![OsString::from("command")],
+                tty: false,
+                upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
+                host_uds: HostUds::None,
+            })
+            .await
+            .unwrap();
+        let id = sandbox.id();
+        drop(sandbox);
+
+        let sandbox = backend.get(id).await.unwrap();
+        let state = temp
+            .path()
+            .join("state")
+            .join(sandbox.id().simple().to_string());
+        let (mut input, input_reader) = io::duplex(64);
+        let (output_writer, mut output) = io::duplex(64);
+        let (error_writer, _) = io::duplex(64);
+        input.write_all(b"without proxy").await.unwrap();
+        input.shutdown().await.unwrap();
+        let process = sandbox
+            .start(Stdio::new(input_reader, output_writer, error_writer))
+            .await
+            .unwrap();
+
+        assert!(state.exists());
+        assert!(!state.join("proxy.sock").exists());
+        process.join().await.unwrap();
+        assert!(!state.exists());
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"without proxy");
+
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(
+            commands
+                .lines()
+                .any(|command| command.contains("--label=io.guardian.sandbox.host-uds=none"))
+        );
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|command| command.contains("--runtime-flag=host-uds=none"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn anonymous_read_only_mount_rejects_writes() {
         let temp = tempfile::tempdir().unwrap();
         let mut backend = Podman::init(Config {
@@ -562,7 +685,7 @@ mod tests {
             .create(Spec {
                 name: None,
                 mounts: vec![OsString::from("type=volume,destination=/readonly,ro")],
-                image: "guardian-demo".into(),
+                image: "alpine:3.23.5".into(),
                 command: vec![
                     OsString::from("sh"),
                     OsString::from("-c"),
@@ -570,6 +693,7 @@ mod tests {
                 ],
                 tty: false,
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
+                host_uds: HostUds::None,
             })
             .await
             .unwrap();
