@@ -43,6 +43,10 @@ impl Cli {
                     .iter()
                     .map(|mount| OsString::from(format!("--mount={mount}"))),
             );
+            for mount in spec.user_mounts {
+                args.push(OsString::from("--mount"));
+                args.push(mount.clone());
+            }
             args.extend(
                 spec.env
                     .iter()
@@ -171,7 +175,7 @@ impl Cli {
 
     pub async fn remove(&self, id: &str) -> Result<()> {
         self.podman()
-            .args(["rm", "--force", "--ignore", id])
+            .args(["rm", "--force", "--ignore", "--volumes", id])
             .output()
             .await?
             .check()
@@ -196,6 +200,7 @@ pub(super) struct Create<'a> {
     pub name: &'a str,
     pub sandbox_id: Uuid,
     pub mounts: &'a [String],
+    pub user_mounts: &'a [OsString],
     pub env: &'a [String],
     pub image: &'a str,
     pub command: &'a [OsString],

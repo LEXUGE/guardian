@@ -45,6 +45,7 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct Spec {
     pub name: Option<String>,
+    pub mounts: Vec<OsString>,
     pub image: String,
     pub command: Vec<OsString>,
     pub tty: bool,
@@ -121,6 +122,7 @@ impl rt::Backend for Podman {
                 name: &name,
                 sandbox_id: id,
                 mounts: &mounts,
+                user_mounts: &spec.mounts,
                 env: &env,
                 image: &spec.image,
                 command: &spec.command,
@@ -476,6 +478,7 @@ mod tests {
         let sandbox = backend
             .create(Spec {
                 name: None,
+                mounts: vec![OsString::from("type=volume,destination=/workspace,ro")],
                 image: "example/image".into(),
                 command: vec![OsString::from("command")],
                 tty: false,
@@ -526,6 +529,11 @@ mod tests {
                 .count(),
             2
         );
+        assert!(
+            commands
+                .lines()
+                .any(|command| command.contains("--mount type=volume,destination=/workspace,ro"))
+        );
         assert_eq!(
             commands
                 .lines()
@@ -535,5 +543,45 @@ mod tests {
         );
         assert!(commands.lines().any(|command| command.contains("stop ")));
         assert!(commands.lines().any(|command| command.contains("rm ")));
+    }
+
+    #[tokio::test]
+    // #[ignore = "requires rootless Podman, runsc, and the guardian-demo image"]
+    async fn anonymous_read_only_mount_rejects_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut backend = Podman::init(Config {
+            podman: "podman".into(),
+            runtime: "runsc".into(),
+            root: temp.path().join("state"),
+            connect_timeout: Duration::from_secs(1),
+            stop_timeout: Duration::from_secs(1),
+        })
+        .await
+        .unwrap();
+        let sandbox = backend
+            .create(Spec {
+                name: None,
+                mounts: vec![OsString::from("type=volume,destination=/readonly,ro")],
+                image: "guardian-demo".into(),
+                command: vec![
+                    OsString::from("sh"),
+                    OsString::from("-c"),
+                    OsString::from("! touch /readonly/file"),
+                ],
+                tty: false,
+                upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
+            })
+            .await
+            .unwrap();
+
+        let code = sandbox
+            .start(Stdio::inherit())
+            .await
+            .unwrap()
+            .join()
+            .await
+            .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        sandbox.remove().await.unwrap();
     }
 }

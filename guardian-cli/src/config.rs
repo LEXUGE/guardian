@@ -118,6 +118,10 @@ pub struct CreateArgs {
     #[arg(long)]
     pub name: Option<String>,
 
+    /// Podman mount specification. May be repeated.
+    #[arg(long = "mount", value_name = "TYPE-SPECIFIC-OPTIONS")]
+    pub mounts: Vec<OsString>,
+
     /// OCI image name or ID.
     pub image: String,
 
@@ -142,6 +146,7 @@ impl CreateArgs {
     pub fn into_spec(self) -> podman::Spec {
         podman::Spec {
             name: self.name,
+            mounts: self.mounts,
             image: self.image,
             command: self.command,
             tty: self.tty,
@@ -163,6 +168,30 @@ mod tests {
         assert_eq!(
             create.command,
             [OsString::from("echo"), OsString::from("hello")]
+        );
+    }
+
+    #[test]
+    fn mounts_are_repeatable() {
+        let cli = Cli::try_parse_from([
+            "guardian",
+            "run",
+            "--mount",
+            "type=bind,source=./workspace,destination=/workspace",
+            "--mount",
+            "type=volume,destination=/cache,ro",
+            "image",
+        ])
+        .unwrap();
+        let Command::Run { create, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            create.mounts,
+            [
+                OsString::from("type=bind,source=./workspace,destination=/workspace"),
+                OsString::from("type=volume,destination=/cache,ro")
+            ]
         );
     }
 }
