@@ -88,5 +88,15 @@ async fn run(runtime: RuntimeArgs, command: Command) -> Result<ExitCode> {
             backend.get(id).await?.remove().await?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::List => {
+            let containers = backend.list().await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&containers).map_err(|error| {
+                    guardian::Error::Podman(format!("failed to serialize container list: {error}"))
+                })?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }

@@ -4,7 +4,6 @@ use std::{pin::Pin, process::ExitCode};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::signal::unix::SignalKind;
-use uuid::Uuid;
 
 use crate::Result;
 
@@ -13,20 +12,22 @@ pub mod podman;
 pub trait Backend: Sized {
     type Config;
     type Spec;
-    type Sandbox: Sandbox;
+    type Id;
+    type Sandbox: Sandbox<Id = Self::Id>;
 
     async fn init(config: Self::Config) -> Result<Self>;
     // creates a persistent sandbox
     async fn create(&mut self, spec: Self::Spec) -> Result<Self::Sandbox>;
-    // recovers a sandbox by UUID
-    async fn get(&self, id: Uuid) -> Result<Self::Sandbox>;
+    // recovers a sandbox by ID
+    async fn get(&self, id: Self::Id) -> Result<Self::Sandbox>;
 }
 
 pub trait Sandbox {
+    type Id;
     type Process: Process;
     type Status;
 
-    fn id(&self) -> Uuid;
+    fn id(&self) -> Self::Id;
     async fn status(&self) -> Result<Self::Status>;
     // requires a non-running sandbox and returns one attached execution.
     async fn start(&self, stdio: Stdio) -> Result<Self::Process>;

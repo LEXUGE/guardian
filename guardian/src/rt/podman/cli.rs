@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
@@ -84,23 +84,29 @@ impl Cli {
         Ok(id)
     }
 
-    pub async fn get(&self, id: Uuid) -> Result<Container> {
-        let label = format!("label={SANDBOX_ID_LABEL}={id}");
-        let output = self
-            .podman()
-            .args([
-                "ps",
-                "--all",
-                "--no-trunc",
-                "--filter=label=io.guardian.managed=true",
-                &format!("--filter={label}"),
-                "--format=json",
-            ])
-            .output()
-            .await?;
+    pub async fn list(&self) -> Result<Vec<Container>> {
+        self.list_filtered(None).await
+    }
+
+    async fn list_filtered(&self, sandbox_id: Option<&str>) -> Result<Vec<Container>> {
+        let mut command = self.podman();
+        command.args([
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--filter=label=io.guardian.managed=true",
+        ]);
+        if let Some(sandbox_id) = sandbox_id {
+            command.arg(format!("--filter=label={SANDBOX_ID_LABEL}={sandbox_id}"));
+        }
+        let output = command.arg("--format=json").output().await?;
         output.check()?;
-        let mut containers: Vec<Container> = serde_json::from_slice(&output.stdout)
-            .map_err(|error| Error::Podman(format!("invalid container list: {error}")))?;
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| Error::Podman(format!("invalid container list: {error}")))
+    }
+
+    pub async fn get(&self, id: Uuid) -> Result<Container> {
+        let mut containers = self.list_filtered(Some(&id.to_string())).await?;
         let container = containers
             .pop()
             .ok_or_else(|| Error::Podman(format!("sandbox {id} does not exist")))?;
@@ -215,16 +221,20 @@ pub(super) struct Create<'a> {
     pub host_uds: HostUds,
 }
 
-#[derive(Deserialize)]
-pub(super) struct Container {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Container {
+    #[serde(rename = "Names")]
+    pub names: Vec<String>,
+    #[serde(rename = "Image")]
+    pub image: String,
     #[serde(rename = "Id")]
     pub container_id: String,
     #[serde(rename = "Labels")]
     pub labels: Labels,
 }
 
-#[derive(Deserialize)]
-pub(super) struct Labels {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Labels {
     #[serde(rename = "io.guardian.sandbox.id")]
     pub id: Uuid,
     #[serde(rename = "io.guardian.sandbox.host-uds", default)]
@@ -260,7 +270,7 @@ mod tests {
         let binary = temp.path().join("podman");
         fs::write(
             &binary,
-            "#!/bin/sh\necho '[{\"Id\":\"container-id\",\"Labels\":{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\",\"io.guardian.sandbox.host-uds\":\"none\",\"other.label\":\"ignored\"}}]'\n",
+            "#!/bin/sh\necho '[{\"Names\":[\"container-name\",\"alias\"],\"Image\":\"example:latest\",\"Id\":\"container-id\",\"Labels\":{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\",\"io.guardian.sandbox.host-uds\":\"none\",\"other.label\":\"ignored\"}}]'\n",
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
@@ -270,6 +280,8 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(container.names, ["container-name", "alias"]);
+        assert_eq!(container.image, "example:latest");
         assert_eq!(container.container_id, "container-id");
         assert_eq!(
             container.labels.id,

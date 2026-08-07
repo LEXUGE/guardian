@@ -110,6 +110,9 @@ pub enum Command {
 
     /// Delete a sandbox.
     Remove { id: Uuid },
+
+    /// List Guardian-managed containers as JSON.
+    List,
 }
 
 #[derive(Debug, clap::Args)]

@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{self, AsyncWriteExt},
     process::Child,
@@ -32,6 +32,8 @@ mod state;
 
 use cli::{Cli, Create};
 use state::{Root, State};
+
+pub use cli::{Container, Labels};
 
 const BOOTSTRAP: &str = "/run/guardian/bootstrap.sh";
 
@@ -56,7 +58,7 @@ pub struct Spec {
     pub host_uds: HostUds,
 }
 
-#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum HostUds {
     #[default]
@@ -96,9 +98,17 @@ pub struct Podman {
     context: Arc<Context>,
 }
 
+impl Podman {
+    /// Lists every container created by Guardian.
+    pub async fn list(&self) -> Result<Vec<Container>> {
+        self.context.cli.list().await
+    }
+}
+
 impl rt::Backend for Podman {
     type Config = Config;
     type Spec = Spec;
+    type Id = Uuid;
     type Sandbox = Sandbox;
 
     async fn init(config: Self::Config) -> Result<Self> {
@@ -183,6 +193,7 @@ pub struct Sandbox {
 }
 
 impl rt::Sandbox for Sandbox {
+    type Id = Uuid;
     type Process = Process;
     type Status = Status;
 
@@ -608,7 +619,7 @@ mod tests {
         fs::write(
             &binary,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    create) echo test-container; exit 0 ;;\n    '--format=json') echo '[{{\"Id\":\"test-container\",\"Labels\":{{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\"}}}}]'; exit 0 ;;\n    '--format={{{{.State}}}}') echo stopped; exit 0 ;;\n    start) cat; exit $? ;;\n  esac\ndone\nexit 1\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    create) echo test-container; exit 0 ;;\n    '--format=json') echo '[{{\"Names\":[\"test-container\"],\"Image\":\"example/image\",\"Id\":\"test-container\",\"Labels\":{{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\"}}}}]'; exit 0 ;;\n    '--format={{{{.State}}}}') echo stopped; exit 0 ;;\n    start) cat; exit $? ;;\n  esac\ndone\nexit 1\n",
                 log.display()
             ),
         )
