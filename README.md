@@ -51,6 +51,7 @@ Some useful options:
 - Pass `--name NAME` to `create` or `run` to use that exact Podman container name. The default is `guardian-UUID`.
 - Pass `--mount SPEC` repeatedly to forward Podman mount specifications at sandbox creation. For example, `--mount type=bind,source=./workspace,destination=/workspace` persists guest writes in `./workspace`.
 - Pass `--volume SPEC` repeatedly to forward Podman volume specifications at sandbox creation. For example, `--volume ./workspace:/workspace` persists guest writes in `./workspace`.
+- Pass `--gvisor-overlay2 VALUE` to configure gVisor's filesystem overlay; it defaults to `root:self`.
 
 Guardian's structured logs are appended to `guardian.jsonl`; use `--log-file` and `RUST_LOG` to configure them.
 

@@ -56,6 +56,7 @@ pub struct Spec {
     pub tty: bool,
     pub upstream_dns: Ipv4Addr,
     pub host_uds: HostUds,
+    pub overlay2: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +163,7 @@ impl rt::Backend for Podman {
                 command: &spec.command,
                 tty: spec.tty,
                 host_uds: spec.host_uds,
+                overlay2: &spec.overlay2,
             })
             .await?;
 
@@ -171,6 +173,7 @@ impl rt::Backend for Podman {
             id,
             container_id,
             host_uds: spec.host_uds,
+            overlay2: spec.overlay2,
         })
     }
 
@@ -181,6 +184,7 @@ impl rt::Backend for Podman {
             id: container.labels.id,
             container_id: container.container_id,
             host_uds: container.labels.host_uds,
+            overlay2: container.labels.overlay2,
         })
     }
 }
@@ -190,6 +194,7 @@ pub struct Sandbox {
     id: Uuid,
     container_id: String,
     host_uds: HostUds,
+    overlay2: String,
 }
 
 impl rt::Sandbox for Sandbox {
@@ -223,10 +228,10 @@ impl rt::Sandbox for Sandbox {
             self.context.proxy.clone(),
         )?;
         let inherit = matches!(&stdio, Stdio::Inherit);
-        let mut child = self
-            .context
-            .cli
-            .start(&self.container_id, inherit, self.host_uds)?;
+        let mut child =
+            self.context
+                .cli
+                .start(&self.container_id, inherit, self.host_uds, &self.overlay2)?;
         let stdio = StdioTask::spawn(stdio, &mut child);
         let container =
             ContainerTask::spawn(Arc::clone(&self.context), self.container_id.clone(), child);
@@ -515,6 +520,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("podman");
         let log = temp.path().join("commands");
+        // This shell script stands in for Podman. It logs the complete argv
+        // for assertions, returns a stable container ID for `create`, reports
+        // `stopped` for status checks, copies attached stdin to stdout with
+        // `cat` during `start`, and makes cleanup commands succeed.
         fs::write(
             &binary,
             format!(
@@ -544,6 +553,7 @@ mod tests {
                 tty: false,
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::Open,
+                overlay2: "root:self".into(),
             })
             .await
             .unwrap();
@@ -616,6 +626,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("podman");
         let log = temp.path().join("commands");
+        // This fake has the same command behavior, but its `--format=json`
+        // response contains only the sandbox ID label. Omitting the gVisor
+        // labels makes recovery exercise their Serde defaults.
         fs::write(
             &binary,
             format!(
@@ -645,6 +658,7 @@ mod tests {
                 tty: false,
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::None,
+                overlay2: "root:self".into(),
             })
             .await
             .unwrap();
@@ -675,15 +689,25 @@ mod tests {
         assert_eq!(bytes, b"without proxy");
 
         let commands = fs::read_to_string(&log).unwrap();
-        assert!(
-            commands
-                .lines()
-                .any(|command| command.contains("--label=io.guardian.sandbox.host-uds=none"))
-        );
+        assert!(commands.lines().any(|command| {
+            command.contains("--label=io.guardian.sandbox.gvisor.host-uds=none")
+        }));
+        // Both create and start passes this flag
         assert_eq!(
             commands
                 .lines()
                 .filter(|command| command.contains("--runtime-flag=host-uds=none"))
+                .count(),
+            2
+        );
+        assert!(commands.lines().any(|command| {
+            command.contains("--label=io.guardian.sandbox.gvisor.overlay2=root:self")
+        }));
+        // Both create and start passes this flag
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|command| command.contains("--runtime-flag=overlay2=root:self"))
                 .count(),
             2
         );
@@ -715,6 +739,7 @@ mod tests {
                 tty: false,
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::None,
+                overlay2: "root:self".into(),
             })
             .await
             .unwrap();

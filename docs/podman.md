@@ -10,7 +10,12 @@ See `guardian/rt/mod.rs`
 
 ## Identity and State
 
-Each sandbox is identified by a UUID. Guardian stores its UUID in the Podman name and labels.
+Each sandbox is identified by a UUID. Guardian stores its UUID in the Podman name and labels. gVisor options are persisted as opaque label values:
+
+| Label | Missing-label default |
+|---|---|
+| `io.guardian.sandbox.gvisor.host-uds` | `none` |
+| `io.guardian.sandbox.gvisor.overlay2` | `root:self` |
 
 There is a central state directory, `/run/guardian` by default, for Guardian. Guardian holds an exclusive lock to the state root. For concurrent use cases, use an RPC server.
 
@@ -55,6 +60,6 @@ On normal completion, `Process` awaits container exit, finishes I/O, stops the p
 
 ## Container configuration
 
-On create, Guardian uses `--network=none`, `--init`, `--interactive`, `--http-proxy=false`, and `--cap-add=NET_BIND_SERVICE`. It mounts State and resolver files read-only, and adds `--tty` when requested. On create and start, it gives runsc `network=none`, `host-uds=open`, and `ignore-cgroups`. Start uses `--attach`, `--interactive`, and `--sig-proxy=false`.
+On create, Guardian uses `--network=none`, `--init`, `--interactive`, `--http-proxy=false`, and `--cap-add=NET_BIND_SERVICE`. It mounts State and resolver files read-only, and adds `--tty` when requested. On create and start, it gives runsc `network=none`, the persisted `host-uds` and `overlay2` values, and `ignore-cgroups`. The CLI accepts the string-valued `--gvisor-overlay2` option, defaulting to `root:self`. Start uses `--attach`, `--interactive`, and `--sig-proxy=false`.
 
 The bootstrap starts the SOCKS and DNS relays, verifies their listeners, then `exec`s the command. Podman's init is PID 1. Guardian does not use privileged mode, host networking, broad host mounts, or cgroup resource enforcement. It does not override the image entrypoint.

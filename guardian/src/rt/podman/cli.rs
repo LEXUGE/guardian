@@ -14,7 +14,8 @@ use crate::{Error, Result};
 
 const MANAGED_LABEL: &str = "io.guardian.managed=true";
 const SANDBOX_ID_LABEL: &str = "io.guardian.sandbox.id";
-const HOST_UDS_LABEL: &str = "io.guardian.sandbox.host-uds";
+const HOST_UDS_LABEL: &str = "io.guardian.sandbox.gvisor.host-uds";
+const OVERLAY2_LABEL: &str = "io.guardian.sandbox.gvisor.overlay2";
 
 #[derive(Debug, Clone)]
 pub(super) struct Cli {
@@ -35,6 +36,7 @@ impl Cli {
                 OsString::from(format!("--label={MANAGED_LABEL}")),
                 OsString::from(format!("--label={SANDBOX_ID_LABEL}={}", spec.sandbox_id)),
                 OsString::from(format!("--label={HOST_UDS_LABEL}={}", spec.host_uds)),
+                OsString::from(format!("--label={OVERLAY2_LABEL}={}", spec.overlay2)),
                 OsString::from("--network=none"),
                 OsString::from("--init"),
                 OsString::from("--http-proxy=false"),
@@ -69,7 +71,7 @@ impl Cli {
 
         let output = self
             .podman()
-            .args(self.rt_args(spec.host_uds))
+            .args(self.rt_args(spec.host_uds, spec.overlay2))
             .args(create_args(spec))
             .output()
             .await?;
@@ -142,9 +144,15 @@ impl Cli {
         }
     }
 
-    pub fn start(&self, id: &str, inherit: bool, host_uds: HostUds) -> Result<Child> {
+    pub fn start(
+        &self,
+        id: &str,
+        inherit: bool,
+        host_uds: HostUds,
+        overlay2: &str,
+    ) -> Result<Child> {
         let mut command = self.podman();
-        command.args(self.rt_args(host_uds)).args([
+        command.args(self.rt_args(host_uds, overlay2)).args([
             "start",
             "--attach",
             "--interactive",
@@ -193,12 +201,13 @@ impl Cli {
             .check()
     }
 
-    fn rt_args(&self, host_uds: HostUds) -> Vec<OsString> {
+    fn rt_args(&self, host_uds: HostUds, overlay2: &str) -> Vec<OsString> {
         vec![
             OsString::from("--runtime"),
             self.runtime.as_os_str().to_owned(),
             OsString::from("--runtime-flag=network=none"),
             OsString::from(format!("--runtime-flag=host-uds={host_uds}")),
+            OsString::from(format!("--runtime-flag=overlay2={overlay2}")),
             OsString::from("--runtime-flag=ignore-cgroups"),
         ]
     }
@@ -219,6 +228,7 @@ pub(super) struct Create<'a> {
     pub command: &'a [OsString],
     pub tty: bool,
     pub host_uds: HostUds,
+    pub overlay2: &'a str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,8 +247,17 @@ pub struct Container {
 pub struct Labels {
     #[serde(rename = "io.guardian.sandbox.id")]
     pub id: Uuid,
-    #[serde(rename = "io.guardian.sandbox.host-uds", default)]
+    #[serde(rename = "io.guardian.sandbox.gvisor.host-uds", default)]
     pub host_uds: HostUds,
+    #[serde(
+        rename = "io.guardian.sandbox.gvisor.overlay2",
+        default = "default_overlay2"
+    )]
+    pub overlay2: String,
+}
+
+fn default_overlay2() -> String {
+    "root:self".into()
 }
 
 trait OutputExt {
@@ -270,7 +289,7 @@ mod tests {
         let binary = temp.path().join("podman");
         fs::write(
             &binary,
-            "#!/bin/sh\necho '[{\"Names\":[\"container-name\",\"alias\"],\"Image\":\"example:latest\",\"Id\":\"container-id\",\"Labels\":{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\",\"io.guardian.sandbox.host-uds\":\"none\",\"other.label\":\"ignored\"}}]'\n",
+            "#!/bin/sh\necho '[{\"Names\":[\"container-name\",\"alias\"],\"Image\":\"example:latest\",\"Id\":\"container-id\",\"Labels\":{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\",\"io.guardian.sandbox.gvisor.host-uds\":\"none\",\"io.guardian.sandbox.gvisor.overlay2\":\"root:dir=/run/guardian\",\"other.label\":\"ignored\"}}]'\n",
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
@@ -288,5 +307,6 @@ mod tests {
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
         );
         assert_eq!(container.labels.host_uds, HostUds::None);
+        assert_eq!(container.labels.overlay2, "root:dir=/run/guardian");
     }
 }

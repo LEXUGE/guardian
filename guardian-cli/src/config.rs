@@ -144,6 +144,10 @@ pub struct CreateArgs {
     #[arg(long, default_value_t = podman::HostUds::Open)]
     pub network: podman::HostUds,
 
+    /// gVisor filesystem overlay configuration.
+    #[arg(long, default_value = "root:self")]
+    pub gvisor_overlay2: String,
+
     /// Command and arguments. Defaults to /bin/sh.
     #[arg(
         trailing_var_arg = true,
@@ -164,6 +168,7 @@ impl CreateArgs {
             tty: self.tty,
             upstream_dns: self.upstream_dns,
             host_uds: self.network,
+            overlay2: self.gvisor_overlay2,
         }
     }
 }
