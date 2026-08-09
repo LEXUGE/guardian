@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum Error {
     #[error("{0}")]
     Config(String),
+    #[error("resource busy: {0}")]
+    Busy(String),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("Podman error: {0}")]

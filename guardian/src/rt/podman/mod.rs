@@ -113,8 +113,7 @@ impl rt::Backend for Podman {
     type Sandbox = Sandbox;
 
     async fn init(config: Self::Config) -> Result<Self> {
-        let root = Root::acquire(config.root)?;
-        root.clear()?;
+        let root = Root::open(config.root)?;
         Ok(Self {
             context: Arc::new(Context {
                 cli: Cli::new(config.podman, config.runtime),
@@ -221,6 +220,7 @@ impl rt::Sandbox for Sandbox {
             }
         }
 
+        // create assures that there is no active guardian process operating on the same sandbox.
         let state = self.context.root.create(Some(self.id))?;
         let proxy = ProxyTask::spawn(
             self.host_uds,

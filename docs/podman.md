@@ -17,9 +17,18 @@ Each sandbox is identified by a UUID. Guardian stores its UUID in the Podman nam
 | `io.guardian.sandbox.gvisor.host-uds` | `none` |
 | `io.guardian.sandbox.gvisor.overlay2` | `root:self` |
 
-There is a central state directory, `/run/guardian` by default, for Guardian. Guardian holds an exclusive lock to the state root. For concurrent use cases, use an RPC server.
+There is a central state directory, `/run/guardian` by default, for Guardian. The root is shared by concurrent Guardian processes and remains after they exit.
 
-Under the state root, each sandbox gets its own state directory, identified by the sandbox UUID. Each State directory has mode `0711`:
+Each sandbox uses an ephemeral state directory identified by its UUID and a persistent sibling lock file:
+
+```text
+<root>/.<uuid>.lock  // mode 0600
+<root>/<uuid>/       // mode 0711
+```
+
+The exclusive advisory lock on `.<uuid>.lock` owns `<uuid>/`. Lock files are never removed because their inodes must remain stable while state directories are deleted and recreated. Acquiring locked state fails immediately. Acquiring unlocked existing state removes and rebuilds it.
+
+Each State directory contains:
 
 | Path | Mode | Purpose |
 |---|---:|---|
@@ -29,26 +38,26 @@ Under the state root, each sandbox gets its own state directory, identified by t
 | `hosts` | `0444` | local hosts |
 | `proxy.sock` | `0666` | per-execution SOCKS transport |
 
-To create such a state directory:
+To acquire such a state directory:
 
 ```rust
-Root::create(None)       // new UUID and State
-Root::create(Some(id))   // create if absent; otherwise no-op
+Root::create(None)       // new UUID, lock, and State
+Root::create(Some(id))   // lock UUID and rebuild State
 ```
 
-Dropping `State` removes its directory and ignores `NotFound`.
+`State` owns the open lock file. Dropping it removes its state directory before releasing the lock and ignores `NotFound`. Acquiring a UUID lazily removes and rebuilds stale state for that UUID; unrelated state is not scanned.
 
 ## Lifecycle
 
 ```text
-init:   lock Root -> clear State
-create: State -> podman create -> drop State -> Sandbox
-start:  status -> State -> ProxyTask -> podman start --attach -> StdioTask -> ContainerTask
-join:   ContainerTask -> StdioTask -> ProxyTask -> drop State
+init:   open Root
+create: lock UUID -> rebuild State -> podman create -> drop State -> Sandbox
+start:  status -> lock UUID -> rebuild State -> ProxyTask -> podman start --attach -> StdioTask -> ContainerTask
+join:   ContainerTask -> StdioTask -> ProxyTask -> drop State -> unlock UUID
 remove: podman rm --force
 ```
 
-Creation uses temporary State because Podman validates bind mount sources. `start()` only accepts `Created` and `Stopped`, then recreates State idempotently. Setup failure releases only resources acquired by that operation. `Sandbox::remove()` is the only container removal path.
+Creation uses temporary State because Podman validates bind mount sources. `start()` only accepts `Created` and `Stopped`. Concurrent operations on different UUIDs proceed independently; concurrent State acquisition for one UUID returns `Error::Busy`. Setup failure releases only resources acquired by that operation. `Sandbox::remove()` is the only container removal path.
 
 `ContainerTask` owns the child of `podman start --attach`. Child exit has priority over shutdown. On shutdown, it runs `podman stop` and waits for the child. Dropping `Process` requests this shutdown but does not await it.
 
