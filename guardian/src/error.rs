@@ -12,6 +12,10 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("Podman error: {0}")]
     Podman(String),
+    #[error("Podman REST API error: {0}")]
+    PodmanApi(#[from] podman_rest_client::Error),
+    #[error("Podman REST request failed: {0}")]
+    PodmanRequest(#[from] reqwest::Error),
     #[error("SOCKS error: {0}")]
     Socks(#[from] fast_socks5::SocksError),
     #[error("SOCKS server error: {0}")]

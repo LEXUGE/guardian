@@ -3,20 +3,20 @@ use std::{
     fmt,
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    process::{ExitCode, ExitStatus},
+    process::ExitCode,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
+use futures::StreamExt;
+use podman_rest_client::{AttachFrame, AttachFrameStream};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{self, AsyncWriteExt},
-    process::Child,
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     signal::unix::{self, SignalKind},
-    sync::watch,
+    sync::{oneshot, watch},
     task::JoinHandle,
-    time::timeout,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -24,10 +24,13 @@ use uuid::Uuid;
 use crate::{
     Error, Result,
     net::uds,
-    rt::{self, Process as _, Stdio},
+    rt::{self, Stdio},
 };
 
+pub mod api;
 mod cli;
+#[cfg(test)]
+mod mock;
 mod state;
 
 use cli::{Cli, Create};
@@ -41,6 +44,7 @@ const BOOTSTRAP: &str = "/run/guardian/bootstrap.sh";
 pub struct Config {
     pub podman: PathBuf,
     pub runtime: PathBuf,
+    pub socket: PathBuf,
     pub root: PathBuf,
     pub connect_timeout: Duration,
     pub stop_timeout: Duration,
@@ -52,11 +56,18 @@ pub struct Spec {
     pub mounts: Vec<OsString>,
     pub volumes: Vec<OsString>,
     pub image: String,
-    pub command: Vec<OsString>,
-    pub tty: bool,
     pub upstream_dns: Ipv4Addr,
     pub host_uds: HostUds,
     pub overlay2: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecSpec {
+    pub command: Vec<String>,
+    pub env: Vec<String>,
+    pub tty: bool,
+    pub user: Option<String>,
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +101,7 @@ impl FromStr for HostUds {
 
 struct Context {
     cli: Cli,
+    exec: Arc<api::ExecApi>,
     root: Root,
     proxy: uds::Config,
     stop_timeout: Duration,
@@ -117,6 +129,7 @@ impl rt::Backend for Podman {
         Ok(Self {
             context: Arc::new(Context {
                 cli: Cli::new(config.podman, config.runtime),
+                exec: Arc::new(api::ExecApi::new(config.socket)?),
                 root,
                 proxy: uds::Config {
                     connect_timeout: config.connect_timeout,
@@ -126,7 +139,7 @@ impl rt::Backend for Podman {
         })
     }
 
-    async fn create(&mut self, mut spec: Self::Spec) -> Result<Self::Sandbox> {
+    async fn create(&mut self, spec: Self::Spec) -> Result<Self::Sandbox> {
         let state = self.context.root.create(None)?;
         let id = state.id();
         let mounts = [
@@ -141,12 +154,26 @@ impl rt::Backend for Podman {
                 source.display()
             )
         });
-        let env = [format!("GUARDIAN_UPSTREAM_DNS={}", spec.upstream_dns)];
+        let mut env = vec![format!("GUARDIAN_UPSTREAM_DNS={}", spec.upstream_dns)];
+        if spec.host_uds == HostUds::Open {
+            env.extend(
+                [
+                    "ALL_PROXY=socks5h://127.0.0.1:1080",
+                    "all_proxy=socks5h://127.0.0.1:1080",
+                    "HTTP_PROXY=socks5h://127.0.0.1:1080",
+                    "http_proxy=socks5h://127.0.0.1:1080",
+                    "HTTPS_PROXY=socks5h://127.0.0.1:1080",
+                    "https_proxy=socks5h://127.0.0.1:1080",
+                    "NO_PROXY=127.0.0.1,localhost",
+                    "no_proxy=127.0.0.1,localhost",
+                ]
+                .map(str::to_owned),
+            );
+        }
 
-        spec.command.insert(0, OsString::from(BOOTSTRAP));
+        let command = [OsString::from(BOOTSTRAP)];
         let name = spec
             .name
-            .take()
             .unwrap_or_else(|| format!("guardian-{}", id.simple()));
         let container_id = self
             .context
@@ -159,8 +186,8 @@ impl rt::Backend for Podman {
                 user_volumes: &spec.volumes,
                 env: &env,
                 image: &spec.image,
-                command: &spec.command,
-                tty: spec.tty,
+                command: &command,
+                stop_timeout: self.context.stop_timeout,
                 host_uds: spec.host_uds,
                 overlay2: &spec.overlay2,
             })
@@ -173,6 +200,7 @@ impl rt::Backend for Podman {
             container_id,
             host_uds: spec.host_uds,
             overlay2: spec.overlay2,
+            active: None,
         })
     }
 
@@ -184,6 +212,7 @@ impl rt::Backend for Podman {
             container_id: container.container_id,
             host_uds: container.labels.host_uds,
             overlay2: container.labels.overlay2,
+            active: None,
         })
     }
 }
@@ -194,11 +223,13 @@ pub struct Sandbox {
     container_id: String,
     host_uds: HostUds,
     overlay2: String,
+    active: Option<Active>,
 }
 
 impl rt::Sandbox for Sandbox {
     type Id = Uuid;
     type Process = Process;
+    type ExecSpec = ExecSpec;
     type Status = Status;
 
     fn id(&self) -> Uuid {
@@ -209,7 +240,7 @@ impl rt::Sandbox for Sandbox {
         self.context.cli.status(&self.container_id).await
     }
 
-    async fn start(&self, stdio: Stdio) -> Result<Self::Process> {
+    async fn start(&mut self) -> Result<()> {
         match self.status().await? {
             Status::Created | Status::Stopped => {}
             Status::Running => {
@@ -220,31 +251,69 @@ impl rt::Sandbox for Sandbox {
             }
         }
 
-        // create assures that there is no active guardian process operating on the same sandbox.
         let state = self.context.root.create(Some(self.id))?;
         let proxy = ProxyTask::spawn(
             self.host_uds,
             &state.proxy_socket(),
             self.context.proxy.clone(),
         )?;
-        let inherit = matches!(&stdio, Stdio::Inherit);
-        let mut child =
-            self.context
-                .cli
-                .start(&self.container_id, inherit, self.host_uds, &self.overlay2)?;
-        let stdio = StdioTask::spawn(stdio, &mut child);
-        let container =
-            ContainerTask::spawn(Arc::clone(&self.context), self.container_id.clone(), child);
+        self.context
+            .cli
+            .start(&self.container_id, self.host_uds, &self.overlay2)
+            .await?;
 
         info!(sandbox_id = %self.id, container_id = %self.container_id, "sandbox started");
-        Ok(Process {
+
+        self.active = Some(Active {
             context: Arc::clone(&self.context),
             container_id: self.container_id.clone(),
-            container,
-            stdio,
             proxy,
             state,
-        })
+        });
+        Ok(())
+    }
+
+    async fn exec(&self, spec: ExecSpec, stdio: Stdio) -> Result<Self::Process> {
+        // we should NOT check if active is Some since it could be managed by another `Sandbox`
+        // instance.
+        if !self.context.root.is_acquired(self.id)? {
+            return Err(Error::Podman(format!(
+                "sandbox {} has no running Guardian owner",
+                self.id
+            )));
+        }
+        if self.status().await? != Status::Running {
+            return Err(Error::Podman(format!(
+                "container {} is not running",
+                self.container_id
+            )));
+        }
+
+        let exec = self.context.exec.run(&self.container_id, &spec).await?;
+        let (stdio, stdio_done) = StdioTask::spawn(stdio, exec.io, spec.tty);
+        let exec = ExecTask::spawn(Arc::clone(&self.context.exec), exec.id, stdio_done);
+
+        Ok(Process { exec, stdio })
+    }
+
+    async fn stop(self) -> Result<()> {
+        self.active
+            .ok_or(Error::Podman(format!(
+                "sandbox {} has no required background tasks",
+                self.id
+            )))?
+            .stop()
+            .await
+    }
+
+    async fn join(self) -> Result<()> {
+        self.active
+            .ok_or(Error::Podman(format!(
+                "sandbox {} has no required background tasks",
+                self.id
+            )))?
+            .join()
+            .await
     }
 
     async fn kill(&self) -> Result<()> {
@@ -252,6 +321,9 @@ impl rt::Sandbox for Sandbox {
     }
 
     async fn remove(self) -> Result<()> {
+        // makes sure there are no other `Sandbox` instance owning the state
+        // and prevents another instance starting the sandbox while we remove it
+        let _lock = self.context.root.acquire(self.id)?;
         self.context.cli.remove(&self.container_id).await
     }
 }
@@ -273,123 +345,172 @@ impl fmt::Display for Status {
     }
 }
 
-pub struct Process {
+#[must_use]
+pub struct Active {
     context: Arc<Context>,
     container_id: String,
-    container: ContainerTask,
-    stdio: StdioTask,
     proxy: ProxyTask,
     state: State,
+}
+
+impl Active {
+    async fn finish(self) -> Result<()> {
+        self.proxy.finish().await?;
+        drop(self.state);
+        Ok(())
+    }
+
+    async fn stop(self) -> Result<()> {
+        let id = self.container_id.clone();
+        self.context
+            .cli
+            .stop(&self.container_id, self.context.stop_timeout)
+            .await?;
+        self.finish().await?;
+        info!(container_id = %id, "sandbox stopped");
+        Ok(())
+    }
+
+    async fn join(self) -> Result<()> {
+        let mut interrupt = unix::signal(SignalKind::interrupt())?;
+        let mut terminate = unix::signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        self.stop().await
+    }
+}
+
+#[must_use]
+pub struct Process {
+    exec: ExecTask,
+    stdio: StdioTask,
 }
 
 impl Process {
     async fn wait(&mut self) -> Result<ExitCode> {
         enum Event {
-            Exited(Result<ExitCode>),
+            Complete(Result<Completion>),
             Signal(SignalKind),
         }
 
         let mut interrupt = unix::signal(SignalKind::interrupt())?;
         let mut terminate = unix::signal(SignalKind::terminate())?;
         let event = tokio::select! {
-            result = &mut self.container.task => Event::Exited(result?),
+            result = &mut self.exec.task => Event::Complete(result?),
             _ = interrupt.recv() => Event::Signal(SignalKind::interrupt()),
             _ = terminate.recv() => Event::Signal(SignalKind::terminate()),
         };
 
         match event {
-            Event::Exited(result) => result,
+            Event::Complete(result) => match result? {
+                Completion::Exited(code) => Ok(code),
+                // this arm is pretty unreacheable
+                Completion::Cancelled => Err(Error::Podman(
+                    "exec was cancelled (not from `Process`)".into(),
+                )),
+            },
             Event::Signal(signal) => {
-                info!(
-                    signal = signal.as_raw_value(),
-                    "forwarding signal to sandbox"
-                );
-                if let Err(error) = self.signal(signal).await {
-                    // The container may exit after select chooses the signal branch
-                    // but before Podman handles it. Prefer its result when the
-                    // supervisor has already observed the exit; other signal errors
-                    // remain failures.
-                    if self.container.task.is_finished() {
-                        return (&mut self.container.task).await?;
-                    }
-                    return Err(error);
-                }
-                match timeout(self.context.stop_timeout, &mut self.container.task).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        self.container.stop();
-                        (&mut self.container.task).await?
-                    }
+                info!(signal = signal.as_raw_value(), "cancelling foreground exec");
+                self.exec.stop();
+                match (&mut self.exec.task).await?? {
+                    // already exited
+                    Completion::Exited(code) => Ok(code),
+                    // successfully aborted
+                    Completion::Cancelled => Ok(ExitCode::from(
+                        // Shells report signal termination as 128 plus the signal number:
+                        // SIGINT is 2 and SIGTERM is 15.
+                        if signal.as_raw_value() == SignalKind::interrupt().as_raw_value() {
+                            130
+                        } else {
+                            143
+                        },
+                    )),
                 }
             }
         }
     }
-
-    async fn finish(self, code: ExitCode) -> Result<ExitCode> {
-        self.stdio.finish().await;
-        self.proxy.finish().await?;
-        drop(self.state);
-
-        info!(container_id = %self.container_id, ?code, "sandbox exited");
-        Ok(code)
-    }
 }
 
 impl rt::Process for Process {
-    async fn signal(&mut self, signal: SignalKind) -> Result<()> {
-        self.context
-            .cli
-            .signal(&self.container_id, signal.as_raw_value())
-            .await
-    }
-
-    async fn stop(mut self) -> Result<ExitCode> {
-        self.container.stop();
-        // Do not use the `join` or `wait` here because we don't want to handle signals.
-        let code = (&mut self.container.task).await??;
-        self.finish(code).await
+    async fn stop(mut self) -> Result<()> {
+        self.exec.stop();
+        match (&mut self.exec.task).await?? {
+            Completion::Exited(_) | Completion::Cancelled => {}
+        }
+        self.stdio.finish().await;
+        Ok(())
     }
 
     async fn join(mut self) -> Result<ExitCode> {
         let code = self.wait().await?;
-        self.finish(code).await
+        self.stdio.finish().await;
+        Ok(code)
     }
 }
 
-struct ContainerTask {
-    shutdown: watch::Sender<bool>,
-    task: JoinHandle<Result<ExitCode>>,
+enum Completion {
+    Exited(ExitCode),
+    Cancelled,
 }
 
-impl ContainerTask {
-    fn spawn(context: Arc<Context>, container_id: String, mut child: Child) -> Self {
+struct ExecTask {
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<Result<Completion>>,
+}
+
+impl ExecTask {
+    fn spawn(
+        api: Arc<api::ExecApi>,
+        exec_id: String,
+        mut stdio_done: oneshot::Receiver<Result<()>>,
+    ) -> Self {
         let (shutdown, mut receiver) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let status = tokio::select! {
+            tokio::select! {
                 biased;
-                status = child.wait() => status?,
-                _ = receiver.changed() => {
-                    context
-                        .cli
-                        .stop(&container_id, context.stop_timeout)
-                        .await?;
-                    child.wait().await?
+                result = &mut stdio_done => {
+                    match result {
+                        // successfully completed
+                        Ok(Ok(())) => {}
+                        // one copying task finished with failure
+                        Ok(Err(error)) => {
+                            // ignore cascading removal failure
+                            let _ = api.remove(&exec_id).await;
+                            return Err(error);
+                        }
+                        // failed to receive the completion result from
+                        Err(_) => {
+                            // ignore cascading removal failure
+                            let _ = api.remove(&exec_id).await;
+                            return Err(Error::Podman(format!(
+                                "stdio task ended without reporting exec {exec_id} completion"
+                            )));
+                        }
+                    }
+
+                    let code = match api.exit_code(&exec_id).await? {
+                        Some(code) => code,
+                        None => {
+                            let _ = api.remove(&exec_id).await;
+                            return Err(Error::Podman(format!(
+                                "exec {exec_id} attachment closed without exit code reported"
+                            )));
+                        }
+                    };
+                    api.remove(&exec_id).await?;
+                    Ok(Completion::Exited(code))
                 }
-            };
-            Self::exit_code(status)
+                _ = receiver.changed() => {
+                    api.remove(&exec_id).await?;
+                    // opportunistically wait for IO completion
+                    let _ = stdio_done.await;
+                    Ok(Completion::Cancelled)
+                }
+            }
         });
         Self { shutdown, task }
-    }
-
-    fn exit_code(status: ExitStatus) -> Result<ExitCode> {
-        let code = status.code().ok_or_else(|| {
-            Error::Podman(format!(
-                "podman attach process exited without a code: {status}"
-            ))
-        })?;
-        let code = u8::try_from(code)
-            .map_err(|_| Error::Podman(format!("invalid podman exit code: {code}")))?;
-        Ok(ExitCode::from(code))
     }
 
     fn stop(&self) {
@@ -397,34 +518,30 @@ impl ContainerTask {
     }
 }
 
-enum StdioTask {
-    Inherit,
-    Redirect {
-        shutdown: watch::Sender<bool>,
-        task: JoinHandle<()>,
-    },
+struct StdioTask {
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<()>,
 }
 
 impl StdioTask {
-    fn spawn(stdio: Stdio, child: &mut Child) -> Self {
-        let Stdio::Redirect {
+    // spawns a bidirectional copying task and notifies through a oneshot receiver when it's done.
+    fn spawn<T>(stdio: Stdio, io: T, tty: bool) -> (Self, oneshot::Receiver<Result<()>>)
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let Stdio {
             mut stdin,
             mut stdout,
             mut stderr,
-        } = stdio
-        else {
-            return Self::Inherit;
-        };
-
-        let mut child_stdin = child.stdin.take().expect("child stdin is piped");
-        let mut child_stdout = child.stdout.take().expect("child stdout is piped");
-        let mut child_stderr = child.stderr.take().expect("child stderr is piped");
+        } = stdio;
+        let (mut reader, mut writer) = io::split(io);
         let (shutdown, mut receiver) = watch::channel(false);
+        let (done, stdio_done) = oneshot::channel();
         let task = tokio::spawn(async move {
             let input = async move {
                 if let Err(error) = async {
-                    io::copy(&mut stdin, &mut child_stdin).await?;
-                    child_stdin.shutdown().await
+                    io::copy(&mut stdin, &mut writer).await?;
+                    writer.shutdown().await
                 }
                 .await
                 {
@@ -432,45 +549,46 @@ impl StdioTask {
                 }
             };
             let output = async move {
-                let stdout = async {
-                    if let Err(error) = async {
-                        io::copy(&mut child_stdout, &mut stdout).await?;
-                        stdout.flush().await
+                if tty {
+                    // if tty then all channels copied to stdout
+                    io::copy(&mut reader, &mut stdout).await?;
+                    stdout.flush().await
+                } else {
+                    let mut frames = AttachFrameStream::new(reader);
+                    while let Some(frame) = frames.next().await {
+                        match frame? {
+                            // Podman's own implementation also forwards channel 0 output into stdin
+                            AttachFrame::Stdin(bytes) | AttachFrame::Stdout(bytes) => {
+                                stdout.write_all(&bytes).await?;
+                            }
+                            AttachFrame::Stderr(bytes) => stderr.write_all(&bytes).await?,
+                        }
                     }
-                    .await
-                    {
-                        warn!(%error, "stdout copy failed");
-                    }
-                };
-                let stderr = async {
-                    if let Err(error) = async {
-                        io::copy(&mut child_stderr, &mut stderr).await?;
-                        stderr.flush().await
-                    }
-                    .await
-                    {
-                        warn!(%error, "stderr copy failed");
-                    }
-                };
-                tokio::join!(stdout, stderr);
+                    stdout.flush().await?;
+                    stderr.flush().await
+                }
             };
 
             tokio::pin!(input);
             tokio::pin!(output);
-            tokio::select! {
+            let result = tokio::select! {
+                // when input EOF, wait for the process to finish
                 _ = input.as_mut() => output.await,
-                _ = output.as_mut() => {},
+                // when process finishes, return the result directly
+                result = output.as_mut() => result,
+                // signal tells us to stop the copying.
                 _ = receiver.changed() => output.await,
-            }
+            };
+            // finished copying
+            let _ = done.send(result.map_err(Error::from));
         });
-        Self::Redirect { shutdown, task }
+        (Self { shutdown, task }, stdio_done)
     }
 
     async fn finish(self) {
-        if let Self::Redirect { shutdown, task } = self {
-            drop(shutdown);
-            let _ = task.await;
-        }
+        drop(self.shutdown);
+        // wait till shutdown
+        let _ = self.task.await;
     }
 }
 
@@ -508,91 +626,128 @@ impl ProxyTask {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
-
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::rt::{Backend as _, Sandbox as _};
+    use crate::rt::{Backend as _, Process as _, Sandbox as _};
+
+    use super::mock::MockPodman;
+
+    // manually assemble the frame using podman protocol
+    fn frame(stream: u8, bytes: &[u8]) -> Vec<u8> {
+        let mut frame = vec![stream, 0, 0, 0];
+        frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        frame.extend_from_slice(bytes);
+        frame
+    }
+
+    fn another_instance(sandbox: &Sandbox) -> Sandbox {
+        Sandbox {
+            context: Arc::clone(&sandbox.context),
+            id: sandbox.id,
+            container_id: sandbox.container_id.clone(),
+            host_uds: sandbox.host_uds,
+            overlay2: sandbox.overlay2.clone(),
+            active: None,
+        }
+    }
+
+    #[tokio::test]
+    // single io stream from podman API should demux into stdout and stderr
+    async fn stdio_demultiplexes_exec_output() {
+        let (io, mut guardian_end) = io::duplex(128);
+        let (mut input, input_reader) = io::duplex(16);
+        let (stdout_writer, mut stdout) = io::duplex(16);
+        let (stderr_writer, mut stderr) = io::duplex(16);
+        input.shutdown().await.unwrap();
+
+        let (stdio, done) = StdioTask::spawn(
+            Stdio::new(input_reader, stdout_writer, stderr_writer),
+            io,
+            false,
+        );
+        guardian_end.write_all(&frame(1, b"out")).await.unwrap();
+        guardian_end.write_all(&frame(2, b"err")).await.unwrap();
+        guardian_end.shutdown().await.unwrap();
+
+        done.await.unwrap().unwrap();
+        stdio.finish().await;
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        stdout.read_to_end(&mut output).await.unwrap();
+        stderr.read_to_end(&mut errors).await.unwrap();
+        assert_eq!(output, b"out");
+        assert_eq!(errors, b"err");
+    }
+
+    #[tokio::test]
+    async fn stdio_copies_tty_output_without_framing() {
+        let (io, mut guardian_end) = io::duplex(64);
+        let (mut input, input_reader) = io::duplex(16);
+        let (stdout_writer, mut stdout) = io::duplex(16);
+        let (stderr_writer, _stderr) = io::duplex(16);
+        input.write_all(b"input").await.unwrap();
+        input.shutdown().await.unwrap();
+
+        let (stdio, done) = StdioTask::spawn(
+            Stdio::new(input_reader, stdout_writer, stderr_writer),
+            io,
+            true,
+        );
+        let mut received = [0; 5];
+        guardian_end.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"input");
+        guardian_end.write_all(b"terminal").await.unwrap();
+        guardian_end.shutdown().await.unwrap();
+
+        done.await.unwrap().unwrap();
+        stdio.finish().await;
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"terminal");
+    }
 
     #[tokio::test]
     async fn sandbox_can_be_started_more_than_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("podman");
-        let log = temp.path().join("commands");
-        // This shell script stands in for Podman. It logs the complete argv
-        // for assertions, returns a stable container ID for `create`, reports
-        // `stopped` for status checks, copies attached stdin to stdout with
-        // `cat` during `start`, and makes cleanup commands succeed.
-        fs::write(
-            &binary,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    create) echo test-container; exit 0 ;;\n    ps) echo stopped; exit 0 ;;\n    start) cat; exit $? ;;\n    stop|kill|rm) exit 0 ;;\n  esac\ndone\nexit 1\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-
+        let mock = MockPodman::new();
+        let root = mock.state_root();
         let mut backend = Podman::init(Config {
-            podman: binary,
+            podman: mock.binary(),
             runtime: "runsc".into(),
-            root: temp.path().join("state"),
+            socket: mock.socket(),
+            root: root.clone(),
             connect_timeout: Duration::from_secs(1),
             stop_timeout: Duration::from_secs(1),
         })
         .await
         .unwrap();
-        let sandbox = backend
+        let mut sandbox = backend
             .create(Spec {
                 name: None,
                 mounts: vec![OsString::from("type=volume,destination=/workspace,ro")],
                 volumes: vec![OsString::from("cache:/cache:ro")],
                 image: "example/image".into(),
-                command: vec![OsString::from("command")],
-                tty: false,
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::Open,
                 overlay2: "root:self".into(),
             })
             .await
             .unwrap();
-        let state = temp
-            .path()
-            .join("state")
-            .join(sandbox.id().simple().to_string());
+        let state = root.join(sandbox.id().simple().to_string());
         assert!(!state.exists());
 
-        let (mut input, input_reader) = io::duplex(64);
-        let (output_writer, mut output) = io::duplex(64);
-        let (error_writer, _errors) = io::duplex(64);
-        input.write_all(b"through process").await.unwrap();
-        input.shutdown().await.unwrap();
-        let process = sandbox
-            .start(Stdio::new(input_reader, output_writer, error_writer))
-            .await
-            .unwrap();
+        let mut second = another_instance(&sandbox);
+        sandbox.start().await.unwrap();
         assert!(state.join("proxy.sock").exists());
-        process.join().await.unwrap();
+        sandbox.stop().await.unwrap();
         assert!(!state.exists());
 
-        let mut bytes = Vec::new();
-        output.read_to_end(&mut bytes).await.unwrap();
-        assert_eq!(bytes, b"through process");
+        let removal = another_instance(&second);
+        second.start().await.unwrap();
+        second.stop().await.unwrap();
+        removal.remove().await.unwrap();
 
-        let (input, _) = io::duplex(64);
-        let (output, _) = io::duplex(64);
-        let (errors, _) = io::duplex(64);
-        sandbox
-            .start(Stdio::new(input, output, errors))
-            .await
-            .unwrap()
-            .stop()
-            .await
-            .unwrap();
-        sandbox.remove().await.unwrap();
-
-        let commands = fs::read_to_string(&log).unwrap();
+        let commands = mock.commands();
         assert_eq!(
             commands
                 .lines()
@@ -619,30 +774,25 @@ mod tests {
         );
         assert!(commands.lines().any(|command| command.contains("stop ")));
         assert!(commands.lines().any(|command| command.contains("rm ")));
+        assert!(commands.contains("--env=HTTPS_PROXY=socks5h://127.0.0.1:1080"));
+        assert!(commands.contains("--env=NO_PROXY=127.0.0.1,localhost"));
+        assert!(!commands.contains("--interactive"));
+        assert!(!commands.contains("--tty"));
+        assert!(!commands.contains("--attach"));
     }
 
     #[tokio::test]
     async fn missing_host_uds_defaults_to_disabled() {
-        let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("podman");
-        let log = temp.path().join("commands");
-        // This fake has the same command behavior, but its `--format=json`
-        // response contains only the sandbox ID label. Omitting the gVisor
-        // labels makes recovery exercise their Serde defaults.
-        fs::write(
-            &binary,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    create) echo test-container; exit 0 ;;\n    '--format=json') echo '[{{\"Names\":[\"test-container\"],\"Image\":\"example/image\",\"Id\":\"test-container\",\"Labels\":{{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\"}}}}]'; exit 0 ;;\n    '--format={{{{.State}}}}') echo stopped; exit 0 ;;\n    start) cat; exit $? ;;\n  esac\ndone\nexit 1\n",
-                log.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-
+        let mock = MockPodman::new();
+        mock.set_containers(
+            r#"[{"Names":["test-container"],"Image":"example/image","Id":"test-container","Labels":{"io.guardian.sandbox.id":"00000000-0000-0000-0000-000000000001"}}]"#,
+        );
+        let root = mock.state_root();
         let mut backend = Podman::init(Config {
-            podman: binary,
+            podman: mock.binary(),
             runtime: "runsc".into(),
-            root: temp.path().join("state"),
+            socket: mock.socket(),
+            root: root.clone(),
             connect_timeout: Duration::from_secs(1),
             stop_timeout: Duration::from_secs(1),
         })
@@ -654,8 +804,6 @@ mod tests {
                 mounts: Vec::new(),
                 volumes: Vec::new(),
                 image: "example/image".into(),
-                command: vec![OsString::from("command")],
-                tty: false,
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::None,
                 overlay2: "root:self".into(),
@@ -665,30 +813,17 @@ mod tests {
         let id = sandbox.id();
         drop(sandbox);
 
-        let sandbox = backend.get(id).await.unwrap();
-        let state = temp
-            .path()
-            .join("state")
-            .join(sandbox.id().simple().to_string());
-        let (mut input, input_reader) = io::duplex(64);
-        let (output_writer, mut output) = io::duplex(64);
-        let (error_writer, _) = io::duplex(64);
-        input.write_all(b"without proxy").await.unwrap();
-        input.shutdown().await.unwrap();
-        let process = sandbox
-            .start(Stdio::new(input_reader, output_writer, error_writer))
-            .await
-            .unwrap();
-
+        let mut sandbox = backend.get(id).await.unwrap();
+        let state = root.join(sandbox.id().simple().to_string());
+        sandbox.start().await.unwrap();
         assert!(state.exists());
         assert!(!state.join("proxy.sock").exists());
-        process.join().await.unwrap();
+        sandbox.stop().await.unwrap();
         assert!(!state.exists());
-        let mut bytes = Vec::new();
-        output.read_to_end(&mut bytes).await.unwrap();
-        assert_eq!(bytes, b"without proxy");
 
-        let commands = fs::read_to_string(&log).unwrap();
+        let commands = mock.commands();
+        assert!(!commands.contains("--env=ALL_PROXY="));
+        assert!(!commands.contains("--env=HTTPS_PROXY="));
         assert!(commands.lines().any(|command| {
             command.contains("--label=io.guardian.sandbox.gvisor.host-uds=none")
         }));
@@ -716,42 +851,47 @@ mod tests {
     #[tokio::test]
     async fn anonymous_read_only_mount_rejects_writes() {
         let temp = tempfile::tempdir().unwrap();
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
         let mut backend = Podman::init(Config {
             podman: "podman".into(),
-            runtime: "runsc".into(),
+            runtime: "/run/current-system/sw/bin/runsc".into(),
+            socket: PathBuf::from(runtime).join("podman/podman.sock"),
             root: temp.path().join("state"),
             connect_timeout: Duration::from_secs(1),
             stop_timeout: Duration::from_secs(1),
         })
         .await
         .unwrap();
-        let sandbox = backend
+        let mut sandbox = backend
             .create(Spec {
                 name: None,
                 mounts: vec![OsString::from("type=volume,destination=/readonly,ro")],
                 volumes: Vec::new(),
                 image: "alpine:3.23.5".into(),
-                command: vec![
-                    OsString::from("sh"),
-                    OsString::from("-c"),
-                    OsString::from("! touch /readonly/file"),
-                ],
-                tty: false,
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::None,
                 overlay2: "root:self".into(),
             })
             .await
             .unwrap();
+        let id = sandbox.id();
 
+        sandbox.start().await.unwrap();
         let code = sandbox
-            .start(Stdio::inherit())
+            .exec(
+                ExecSpec {
+                    command: vec!["sh".into(), "-c".into(), "! touch /readonly/file".into()],
+                    ..Default::default()
+                },
+                Stdio::new(tokio::io::empty(), tokio::io::sink(), tokio::io::sink()),
+            )
             .await
             .unwrap()
             .join()
             .await
             .unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
-        sandbox.remove().await.unwrap();
+        sandbox.stop().await.unwrap();
+        backend.get(id).await.unwrap().remove().await.unwrap();
     }
 }

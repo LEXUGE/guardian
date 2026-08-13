@@ -149,7 +149,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn proxies_a_socks5_connect_over_unix_socket() {
+    async fn end_to_end_connection_test() {
         let temp = tempfile::tempdir().unwrap();
         let socket_path = temp.path().join("proxy.sock");
         let server = Proxy::bind(
@@ -166,6 +166,7 @@ mod tests {
         let (shutdown, receiver) = watch::channel(false);
         let server_task = tokio::spawn(server.run(receiver));
 
+        // An echo server that mocks the remote destination
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_address = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
@@ -175,6 +176,7 @@ mod tests {
             stream.write_all(&buffer[..read]).await.unwrap();
         });
 
+        // client authenticate with the SOCKS server over UDS
         let mut client = UnixStream::connect(socket_path).await.unwrap();
         client.write_all(&[5, 1, 0]).await.unwrap();
         let mut auth = [0u8; 2];
@@ -189,6 +191,7 @@ mod tests {
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply[..2], &[5, 0]);
 
+        // sends over the actual bytes
         client.write_all(b"hello").await.unwrap();
         let mut echoed = [0u8; 5];
         client.read_exact(&mut echoed).await.unwrap();

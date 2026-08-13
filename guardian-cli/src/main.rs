@@ -1,12 +1,13 @@
 mod config;
+mod stdio;
 
 use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, process::ExitCode, sync::Mutex};
 
 use clap::Parser;
-use config::{Cli, Command, RuntimeArgs};
+use config::{Cli, Command};
 use guardian::{
     Result,
-    rt::{Backend as _, Process as _, Sandbox as _, Stdio, podman::Podman},
+    rt::{Backend as _, Process as _, Sandbox as _, podman::Podman},
 };
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
@@ -18,6 +19,21 @@ async fn main() -> ExitCode {
         runtime,
         command,
     } = Cli::parse();
+    let config = match runtime.into_config() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("guardian: {error}");
+            return ExitCode::from(125);
+        }
+    };
+    let log_file = log_file.unwrap_or_else(|| config.root.join("log.jsonl"));
+    let backend = match Podman::init(config).await {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("guardian: {error}");
+            return ExitCode::from(125);
+        }
+    };
     let log = match OpenOptions::new()
         .create(true)
         .append(true)
@@ -38,7 +54,7 @@ async fn main() -> ExitCode {
         .with_writer(Mutex::new(log))
         .init();
 
-    let result = run(runtime, command).await;
+    let result = run(backend, command).await;
     match result {
         Ok(code) => code,
         Err(error) => {
@@ -48,33 +64,64 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(runtime: RuntimeArgs, command: Command) -> Result<ExitCode> {
-    let mut backend = Podman::init(runtime.into_config()?).await?;
-
+async fn run(mut backend: Podman, command: Command) -> Result<ExitCode> {
     match command {
         Command::Create(args) => {
             let sandbox = backend.create(args.into_spec()).await?;
             println!("{}", sandbox.id());
             Ok(ExitCode::SUCCESS)
         }
-        Command::Run { create, ephemeral } => {
-            let sandbox = backend.create(create.into_spec()).await?;
-            eprintln!("guardian: sandbox {}", sandbox.id());
-            let result = async { sandbox.start(Stdio::inherit()).await?.join().await }.await;
+        Command::Run {
+            create,
+            exec,
+            ephemeral,
+        } => {
+            let exec = exec.into_spec();
+            let mut sandbox = backend.create(create.into_spec()).await?;
+            let id = sandbox.id();
+            eprintln!("guardian: sandbox {id}");
+            let result = async {
+                sandbox.start().await?;
+                let (stdio, terminal) = match stdio::inherit(exec.tty) {
+                    Ok(stdio) => stdio,
+                    Err(error) => {
+                        if let Err(cleanup_error) = sandbox.stop().await {
+                            warn!(%cleanup_error, "failed to stop sandbox after stdio setup failed");
+                        }
+                        return Err(error);
+                    }
+                };
+                let process = match sandbox.exec(exec, stdio).await {
+                    Ok(process) => process.join().await,
+                    Err(error) => Err(error),
+                };
+                drop(terminal);
+                let cleanup = sandbox.stop().await;
+                let code = process?;
+                cleanup?;
+                Ok(code)
+            }
+            .await;
 
-            if ephemeral && let Err(remove_error) = sandbox.remove().await {
+            if ephemeral
+                && let Err(remove_error) = async { backend.get(id).await?.remove().await }.await
+            {
                 warn!(%remove_error, "failed to remove ephemeral sandbox");
             }
             result
         }
         Command::Start { id } => {
-            backend
-                .get(id)
-                .await?
-                .start(Stdio::inherit())
-                .await?
-                .join()
-                .await
+            let mut sandbox = backend.get(id).await?;
+            sandbox.start().await?;
+            sandbox.join().await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Exec { id, exec } => {
+            let exec = exec.into_spec();
+            let (stdio, terminal) = stdio::inherit(exec.tty)?;
+            let result = backend.get(id).await?.exec(exec, stdio).await?.join().await;
+            drop(terminal);
+            result
         }
         Command::Status { id } => {
             println!("{}", backend.get(id).await?.status().await?);

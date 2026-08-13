@@ -1,12 +1,7 @@
-use std::{
-    ffi::OsString,
-    path::PathBuf,
-    process::{Output, Stdio},
-    time::Duration,
-};
+use std::{ffi::OsString, path::PathBuf, process::Output, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use uuid::Uuid;
 
 use super::{HostUds, Status};
@@ -41,7 +36,9 @@ impl Cli {
                 OsString::from("--init"),
                 OsString::from("--http-proxy=false"),
                 OsString::from("--cap-add=NET_BIND_SERVICE"),
-                OsString::from("--interactive"),
+                // sets the `stop_timeout` which is used by the exec session force remove
+                // redundant for container removal as it sets time independently
+                OsString::from(format!("--stop-timeout={}", spec.stop_timeout.as_secs())),
             ];
             args.extend(
                 spec.mounts
@@ -61,9 +58,6 @@ impl Cli {
                     .iter()
                     .map(|variable| OsString::from(format!("--env={variable}"))),
             );
-            if spec.tty {
-                args.push(OsString::from("--tty"));
-            }
             args.push(OsString::from(spec.image));
             args.extend(spec.command.iter().cloned());
             args
@@ -112,11 +106,6 @@ impl Cli {
         let container = containers
             .pop()
             .ok_or_else(|| Error::Podman(format!("sandbox {id} does not exist")))?;
-        if !containers.is_empty() {
-            return Err(Error::Podman(format!(
-                "multiple containers use sandbox ID {id}"
-            )));
-        }
         Ok(container)
     }
 
@@ -144,33 +133,10 @@ impl Cli {
         }
     }
 
-    pub fn start(
-        &self,
-        id: &str,
-        inherit: bool,
-        host_uds: HostUds,
-        overlay2: &str,
-    ) -> Result<Child> {
-        let mut command = self.podman();
-        command.args(self.rt_args(host_uds, overlay2)).args([
-            "start",
-            "--attach",
-            "--interactive",
-            "--sig-proxy=false",
-            id,
-        ]);
-
-        #[rustfmt::skip]
-        command
-            .stdin(if inherit { Stdio::inherit() } else { Stdio::piped() })
-            .stdout(if inherit { Stdio::inherit() } else { Stdio::piped() })
-            .stderr(if inherit { Stdio::inherit() } else { Stdio::piped() });
-        Ok(command.spawn()?)
-    }
-
-    pub async fn signal(&self, id: &str, signal: i32) -> Result<()> {
+    pub async fn start(&self, id: &str, host_uds: HostUds, overlay2: &str) -> Result<()> {
         self.podman()
-            .args(["kill", &format!("--signal={signal}"), id])
+            .args(self.rt_args(host_uds, overlay2))
+            .args(["start", id])
             .output()
             .await?
             .check()
@@ -226,7 +192,7 @@ pub(super) struct Create<'a> {
     pub env: &'a [String],
     pub image: &'a str,
     pub command: &'a [OsString],
-    pub tty: bool,
+    pub stop_timeout: Duration,
     pub host_uds: HostUds,
     pub overlay2: &'a str,
 }
@@ -279,22 +245,16 @@ impl OutputExt for Output {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
-
-    use super::*;
+    use super::{super::mock::MockPodman, *};
 
     #[tokio::test]
     async fn get_deserializes_sandbox_labels() {
-        let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("podman");
-        fs::write(
-            &binary,
-            "#!/bin/sh\necho '[{\"Names\":[\"container-name\",\"alias\"],\"Image\":\"example:latest\",\"Id\":\"container-id\",\"Labels\":{\"io.guardian.sandbox.id\":\"00000000-0000-0000-0000-000000000001\",\"io.guardian.sandbox.gvisor.host-uds\":\"none\",\"io.guardian.sandbox.gvisor.overlay2\":\"root:dir=/run/guardian\",\"other.label\":\"ignored\"}}]'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mock = MockPodman::new();
+        mock.set_containers(
+            r#"[{"Names":["container-name","alias"],"Image":"example:latest","Id":"container-id","Labels":{"io.guardian.sandbox.id":"00000000-0000-0000-0000-000000000001","io.guardian.sandbox.gvisor.host-uds":"none","io.guardian.sandbox.gvisor.overlay2":"root:dir=/run/guardian","other.label":"ignored"}}]"#,
+        );
 
-        let container = Cli::new(binary, "runsc".into())
+        let container = Cli::new(mock.binary(), "runsc".into())
             .get(Uuid::new_v4())
             .await
             .unwrap();

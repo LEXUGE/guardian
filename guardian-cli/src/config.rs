@@ -10,9 +10,9 @@ use uuid::Uuid;
     about = "Secure, auditable computing environment for AI agent"
 )]
 pub struct Cli {
-    /// Append structured logs to this file.
-    #[arg(long, global = true, default_value = "guardian.jsonl")]
-    pub log_file: PathBuf,
+    /// Append structured logs to this file. Defaults to STATE_ROOT/log.jsonl.
+    #[arg(long, global = true)]
+    pub log_file: Option<PathBuf>,
 
     #[command(flatten)]
     pub runtime: RuntimeArgs,
@@ -30,6 +30,10 @@ pub struct RuntimeArgs {
     /// gVisor OCI runtime executable or configured runtime name.
     #[arg(long, global = true, default_value = "runsc")]
     runtime: PathBuf,
+
+    /// Podman API Unix socket. Defaults below XDG_RUNTIME_DIR.
+    #[arg(long, global = true)]
+    podman_socket: Option<PathBuf>,
 
     /// Private Guardian runtime directory (must have mode 0700).
     #[arg(long, global = true)]
@@ -56,27 +60,45 @@ pub struct RuntimeArgs {
 
 impl RuntimeArgs {
     pub fn into_config(self) -> Result<podman::Config> {
-        let root = match self.state_root {
-            Some(path) if path.is_absolute() => path,
-            Some(path) => std::env::current_dir()?.join(path),
-            None => {
-                let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
-                    Error::Config("XDG_RUNTIME_DIR is unset; pass --state-root explicitly".into())
-                })?;
-                let runtime = PathBuf::from(runtime);
-                if !runtime.is_absolute() || !runtime.is_dir() {
-                    return Err(Error::Config(format!(
-                        "XDG_RUNTIME_DIR does not name an existing absolute directory: {}",
-                        runtime.display()
-                    )));
-                }
-                runtime.join("guardian")
+        let runtime_dir = || {
+            let path = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .ok_or_else(|| Error::Config("XDG_RUNTIME_DIR is unset".into()))?;
+            if !path.is_absolute() || !path.is_dir() {
+                return Err(Error::Config(format!(
+                    "XDG_RUNTIME_DIR does not name an existing absolute directory: {}",
+                    path.display()
+                )));
             }
+            Ok(path)
+        };
+        let absolute = |path: PathBuf| -> Result<PathBuf> {
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Ok(std::env::current_dir()?.join(path))
+            }
+        };
+
+        let root = match self.state_root {
+            Some(path) => absolute(path)?,
+            None => runtime_dir()?.join("guardian"),
+        };
+        let socket = match self.podman_socket {
+            Some(path) if path.is_absolute() => path,
+            Some(path) => {
+                return Err(Error::Config(format!(
+                    "Podman socket path is not absolute: {}",
+                    path.display()
+                )));
+            }
+            None => runtime_dir()?.join("podman/podman.sock"),
         };
 
         Ok(podman::Config {
             podman: self.podman,
             runtime: self.runtime,
+            socket,
             root,
             connect_timeout: self.connect_timeout,
             stop_timeout: self.stop_timeout,
@@ -89,18 +111,29 @@ pub enum Command {
     /// Create a persistent sandbox.
     Create(CreateArgs),
 
-    /// Create, start, and attach to a sandbox.
+    /// Create a sandbox, run one command, then stop the sandbox.
     Run {
         #[command(flatten)]
         create: CreateArgs,
 
-        /// Remove the sandbox after it exits.
+        #[command(flatten)]
+        exec: ExecArgs,
+
+        /// Remove the sandbox after the command exits.
         #[arg(long, default_value_t = true)]
         ephemeral: bool,
     },
 
-    /// Start and attach to a sandbox.
+    /// Start a sandbox and own it until interrupted.
     Start { id: Uuid },
+
+    /// Execute one command in a running sandbox.
+    Exec {
+        id: Uuid,
+
+        #[command(flatten)]
+        exec: ExecArgs,
+    },
 
     /// Print sandbox status.
     Status { id: Uuid },
@@ -132,10 +165,6 @@ pub struct CreateArgs {
     /// OCI image name or ID.
     pub image: String,
 
-    /// Allocate a terminal instead of separate stdout and stderr streams.
-    #[arg(long)]
-    pub tty: bool,
-
     /// Upstream recursive resolver used by the DNS-over-TCP relay.
     #[arg(long, default_value = "1.1.1.1")]
     pub upstream_dns: Ipv4Addr,
@@ -147,6 +176,13 @@ pub struct CreateArgs {
     /// gVisor filesystem overlay configuration.
     #[arg(long, default_value = "root:self")]
     pub gvisor_overlay2: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ExecArgs {
+    /// Allocate a guest terminal and use the inherited host terminal in raw mode.
+    #[arg(short = 't', long)]
+    pub tty: bool,
 
     /// Command and arguments. Defaults to /bin/sh.
     #[arg(
@@ -154,7 +190,17 @@ pub struct CreateArgs {
         allow_hyphen_values = true,
         default_value = "/bin/sh"
     )]
-    pub command: Vec<OsString>,
+    pub command: Vec<String>,
+}
+
+impl ExecArgs {
+    pub fn into_spec(self) -> podman::ExecSpec {
+        podman::ExecSpec {
+            command: self.command,
+            tty: self.tty,
+            ..Default::default()
+        }
+    }
 }
 
 impl CreateArgs {
@@ -164,8 +210,6 @@ impl CreateArgs {
             mounts: self.mounts,
             volumes: self.volumes,
             image: self.image,
-            command: self.command,
-            tty: self.tty,
             upstream_dns: self.upstream_dns,
             host_uds: self.network,
             overlay2: self.gvisor_overlay2,
@@ -180,13 +224,27 @@ mod tests {
     #[test]
     fn explicit_command_replaces_default() {
         let cli = Cli::try_parse_from(["guardian", "run", "image", "echo", "hello"]).unwrap();
-        let Command::Run { create, .. } = cli.command else {
+        let Command::Run { exec, .. } = cli.command else {
             panic!("expected run command");
         };
-        assert_eq!(
-            create.command,
-            [OsString::from("echo"), OsString::from("hello")]
-        );
+        assert_eq!(exec.command, ["echo", "hello"]);
+    }
+
+    #[test]
+    fn tty_is_an_exec_option() {
+        let cli = Cli::try_parse_from([
+            "guardian",
+            "exec",
+            "00000000-0000-0000-0000-000000000001",
+            "-t",
+            "bash",
+        ])
+        .unwrap();
+        let Command::Exec { exec, .. } = cli.command else {
+            panic!("expected exec command");
+        };
+        assert!(exec.tty);
+        assert_eq!(exec.command, ["bash"]);
     }
 
     #[test]
@@ -250,5 +308,18 @@ mod tests {
             panic!("expected create command");
         };
         assert_eq!(none.network, podman::HostUds::None);
+    }
+
+    #[test]
+    fn podman_socket_must_be_absolute() {
+        let cli = Cli::try_parse_from([
+            "guardian",
+            "--state-root=/tmp/guardian-test",
+            "--podman-socket=podman.sock",
+            "list",
+        ])
+        .unwrap();
+        let error = cli.runtime.into_config().unwrap_err();
+        assert!(error.to_string().contains("socket path is not absolute"));
     }
 }

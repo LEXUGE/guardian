@@ -18,19 +18,7 @@ wait_for_tcp4_listener() {
     return 1
 }
 
-unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy
-
 if [ -S /run/guardian/proxy.sock ]; then
-    ALL_PROXY=socks5h://127.0.0.1:1080
-    all_proxy="$ALL_PROXY"
-    HTTP_PROXY="$ALL_PROXY"
-    http_proxy="$ALL_PROXY"
-    HTTPS_PROXY="$ALL_PROXY"
-    https_proxy="$ALL_PROXY"
-    NO_PROXY=127.0.0.1,localhost
-    no_proxy="$NO_PROXY"
-    export ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy
-
     socat TCP4-LISTEN:1080,bind=127.0.0.1,reuseaddr,fork \
         UNIX-CONNECT:/run/guardian/proxy.sock &
     socks_pid=$!
@@ -42,4 +30,8 @@ if [ -S /run/guardian/proxy.sock ]; then
     wait_for_tcp4_listener 0035 "$dns_pid" || exit 125
 fi
 
-exec "$@"
+trap 'exit 0' INT TERM
+while :; do
+    sleep 86400 &
+    wait "$!"
+done

@@ -1,9 +1,9 @@
 //! Private runtime and per-sandbox filesystem state.
 
 use std::{
-    fs::{self, File, OpenOptions, TryLockError},
+    fs::{self, DirBuilder, File, OpenOptions, TryLockError},
     io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -20,16 +20,36 @@ pub struct Root {
     path: PathBuf,
 }
 
+#[derive(Debug)]
+// We use FD instead of process as the proof of owner for a particular state, since FD is inherited
+// after fork and can also be cloned, we therefore explicitly unlock the file when dropping the
+// lock, hence this wrapper
+pub struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // Closing the descriptor is insufficient: a concurrently forked child may
+        // hold an inherited duplicate until exec closes it. Explicit unlock makes
+        // the kernel lock lifetime match this guard's logical ownership lifetime.
+        if let Err(error) = self.0.unlock() {
+            warn!(%error, "failed to unlock sandbox state");
+        }
+    }
+}
+
 impl Root {
     pub fn open(path: PathBuf) -> Result<Self> {
+        // Get the metadata of the path without following symlink (if the path is one).
         match fs::symlink_metadata(&path) {
             Ok(metadata) => {
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                if !metadata.is_dir() {
                     return Err(Error::Config(format!(
                         "Guardian state root is not a directory: {}",
                         path.display()
                     )));
                 }
+                // Mode includes higher bits which are irrelevant to permission (e.g. 0o41777
+                // instead of 777), hence truncation to lower bits.
                 let mode = metadata.permissions().mode() & 0o777;
                 if mode != 0o700 {
                     return Err(Error::Config(format!(
@@ -39,7 +59,14 @@ impl Root {
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(&path)?;
+                DirBuilder::new()
+                    .recursive(true)
+                    // ensures the permission on creation is never broader than 700
+                    // this is preferable to `create_dir_all` which assumes umask which might be
+                    // too broad.
+                    .mode(0o700)
+                    .create(&path)?;
+                // then makes sure it's exactly 700
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
             }
             Err(error) => return Err(error.into()),
@@ -53,6 +80,7 @@ impl Root {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                // again to ensure permission is never broader than the `mode` supplied.
                 .mode(mode)
                 .open(path)?;
             file.write_all(contents)?;
@@ -65,7 +93,7 @@ impl Root {
         let state = State {
             id,
             path: self.path.join(id.simple().to_string()),
-            _lock: self.try_acquire(id)?,
+            _lock: self.acquire(id)?,
         };
 
         state.remove()?;
@@ -96,23 +124,33 @@ impl Root {
         Ok(state)
     }
 
-    fn try_acquire(&self, id: Uuid) -> Result<File> {
+    pub fn acquire(&self, id: Uuid) -> Result<Lock> {
         let path = self.path.join(format!(".{}.lock", id.simple()));
         let lock = OpenOptions::new()
+            .truncate(true)
             .create(true)
-            .truncate(false)
-            .read(true)
             .write(true)
             .mode(0o600)
             .open(path)?;
         lock.set_permissions(fs::Permissions::from_mode(0o600))?;
 
         match lock.try_lock() {
-            Ok(()) => Ok(lock),
+            Ok(()) => Ok(Lock(lock)),
             Err(TryLockError::WouldBlock) => Err(Error::Busy(format!(
                 "another Guardian process owns sandbox state {id}"
             ))),
             Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    pub fn is_acquired(&self, id: Uuid) -> Result<bool> {
+        match self.acquire(id) {
+            Ok(lock) => {
+                drop(lock);
+                Ok(false)
+            }
+            Err(Error::Busy(_)) => Ok(true),
+            Err(error) => Err(error),
         }
     }
 }
@@ -121,7 +159,7 @@ impl Root {
 pub struct State {
     id: Uuid,
     path: PathBuf,
-    _lock: File,
+    _lock: Lock,
 }
 
 impl State {
@@ -161,6 +199,8 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        // Rust drops fields after this method returns, so `_lock` remains held
+        // while the state directory is removed and unlocks immediately afterward.
         if let Err(error) = self.remove() {
             warn!(path = %self.path.display(), %error, "failed to remove sandbox state");
         }
@@ -172,7 +212,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creates_controlled_sandbox_files() {
+    fn checks_sandbox_state_has_right_content_and_permissions() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("guardian");
         let root = Root::open(root_path.clone()).unwrap();
@@ -187,7 +227,8 @@ mod tests {
                 .unwrap()
                 .contains("SOCKS5-CONNECT")
         );
-        assert!(BOOTSTRAP.contains("exec \"$@\""));
+        assert!(BOOTSTRAP.contains("while :; do"));
+        assert!(BOOTSTRAP.contains("trap 'exit 0' INT TERM"));
         assert!(
             std::process::Command::new("sh")
                 .args(["-n", state.path.join("bootstrap.sh").to_str().unwrap()])
@@ -228,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_root_can_be_shared() {
+    fn multiple_root_instances_allowed() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("guardian");
         let _first = Root::open(path.clone()).unwrap();
@@ -245,11 +286,28 @@ mod tests {
         let state = first.create(Some(id)).unwrap();
 
         assert!(matches!(second.create(Some(id)), Err(Error::Busy(_))));
+        assert!(second.is_acquired(id).unwrap());
         assert!(state.resolv_conf().exists());
+        drop(state);
+        assert!(!second.is_acquired(id).unwrap());
     }
 
     #[test]
-    fn distinct_sandbox_states_are_independent() {
+    fn explicit_unlock_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path().join("guardian")).unwrap();
+        let id = Uuid::new_v4();
+        let state = root.create(Some(id)).unwrap();
+        let inherited = state._lock.0.try_clone().unwrap();
+
+        drop(state);
+
+        assert!(!root.is_acquired(id).unwrap());
+        drop(inherited);
+    }
+
+    #[test]
+    fn distinct_sandbox_states_can_coexist() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("guardian");
         let first = Root::open(path.clone()).unwrap();
@@ -266,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuilds_existing_state() {
+    fn rebuilds_existing_state_on_creation() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("guardian");
         let root = Root::open(path.clone()).unwrap();
@@ -282,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_unrelated_state_untouched() {
+    fn leaves_unrelated_folder_untouched() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("guardian");
         let root = Root::open(path.clone()).unwrap();

@@ -7,53 +7,67 @@ While it aims to support generic sandbox backends, currently the implementation 
 It aims to be simple so you could review the code and customize.
 
 > [!WARNING]
-> The project is currently a prototype. Currently the network proxy is "log-only" and enforces no filtering. In particular it's possible for guest to access local services. Modify the code if you need specific enforcement.
+> The project is currently a prototype. Currently the network proxy is "log-only" and enforces no filtering. In particular it's possible for guest to access local services. Use `--network=none` if needed.
 
 ## Quickstart
 
 You would need:
-- Linux with rootless Podman and `runsc`
+- Linux with rootless Podman and `runsc`.
+- Podman socket enabled.
 - an image containing `socat` without an `ENTRYPOINT` (see [example image](examples/demo-image)). Guardian preserves image entrypoint semantics and supplies its bootstrap as the container command.
 
 ```sh
 nix develop
 podman build -t guardian-demo examples/demo-image
-cargo run -p guardian-cli -- run guardian-demo --ephemeral -- curl https://example.com
+cargo run -p guardian-cli -- run --ephemeral guardian-demo curl https://example.com
 ```
 
 Guardian CLI exposes several commands:
 ```
+Usage: guardian [OPTIONS] <COMMAND>
+
 Commands:
   create  Create a persistent sandbox
-  run     Create, start, and attach to a sandbox
-  start   Start and attach to a sandbox
+  run     Create a sandbox, run one command, then stop the sandbox
+  start   Start a sandbox and own it until interrupted
+  exec    Execute one command in a running sandbox
   status  Print sandbox status
   kill    Force-stop a sandbox
   remove  Delete a sandbox
+  list    List Guardian-managed containers as JSON
   help    Print this message or the help of the given subcommand(s)
 ```
 
 > [!NOTE]
 > `create` and later `start` must use the same `--state-root`; the default is `$XDG_RUNTIME_DIR/guardian`.
 
-Each sandbox is identified through an UUID which you would need to `start`, `status`, `kill`, and `remove`:
+Each sandbox has one foreground `start` owner and zero or more concurrent `exec`
+commands. In one terminal:
 
 ```sh
-id=$(guardian create guardian-demo -- /bin/sh)
+id=$(guardian create guardian-demo)
 guardian start "$id"
-guardian status "$id"
-guardian kill "$id"
-guardian remove "$id"
 ```
 
+While that owner is running, another terminal can execute commands:
+
+```sh
+guardian exec "$id" curl https://example.com
+guardian exec -t "$id" bash
+guardian status "$id"
+```
+
+Interrupt `guardian start` to stop the sandbox, then remove it with
+`guardian remove "$id"`.
+
 Some useful options:
-- Pass `--ephemeral` to `run` to remove its sandbox after the attached process exits.
-- Pass `--name NAME` to `create` or `run` to use that exact Podman container name. The default is `guardian-UUID`.
+- Pass `--network=<open|none>` to enable/disable Unix domain socket based networking.
+- Pass `--ephemeral` (default to true) to `run` to remove its sandbox after the command exits.
+- Command stdin, stdout, and stderr are inherited. Pass `-t`/`--tty` to
+  allocate a guest terminal.
+- Pass `--name NAME` to `create` or `run` to specify exact Podman container name.
 - Pass `--mount SPEC` repeatedly to forward Podman mount specifications at sandbox creation. For example, `--mount type=bind,source=./workspace,destination=/workspace` persists guest writes in `./workspace`.
 - Pass `--volume SPEC` repeatedly to forward Podman volume specifications at sandbox creation. For example, `--volume ./workspace:/workspace` persists guest writes in `./workspace`.
 - Pass `--gvisor-overlay2 VALUE` to configure gVisor's filesystem overlay; it defaults to `root:self`.
 
-Guardian's structured logs are appended to `guardian.jsonl`; use `--log-file` and `RUST_LOG` to configure them.
-
-## Documentation
-See the [runtime interface](docs/interface.md), [Podman backend](docs/podman.md), and [network](docs/net.md) documentation.
+Guardian's structured logs are appended to `<STATE_ROOT>/log.jsonl`; use `--log-file` and `RUST_LOG` to configure them.
