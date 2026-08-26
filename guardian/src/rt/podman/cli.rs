@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use super::{HostUds, Status};
+use super::{GVisorPlatform, HostUds, Status};
 use crate::{Error, Result};
 
 const MANAGED_LABEL: &str = "io.guardian.managed=true";
 const SANDBOX_ID_LABEL: &str = "io.guardian.sandbox.id";
 const HOST_UDS_LABEL: &str = "io.guardian.sandbox.gvisor.host-uds";
 const OVERLAY2_LABEL: &str = "io.guardian.sandbox.gvisor.overlay2";
+const PLATFORM_LABEL: &str = "io.guardian.sandbox.gvisor.platform";
 
 #[derive(Debug, Clone)]
 pub(super) struct Cli {
@@ -32,6 +33,7 @@ impl Cli {
                 OsString::from(format!("--label={SANDBOX_ID_LABEL}={}", spec.sandbox_id)),
                 OsString::from(format!("--label={HOST_UDS_LABEL}={}", spec.host_uds)),
                 OsString::from(format!("--label={OVERLAY2_LABEL}={}", spec.overlay2)),
+                OsString::from(format!("--label={PLATFORM_LABEL}={}", spec.platform)),
                 OsString::from("--network=none"),
                 OsString::from("--init"),
                 OsString::from("--http-proxy=false"),
@@ -65,7 +67,7 @@ impl Cli {
 
         let output = self
             .podman()
-            .args(self.rt_args(spec.host_uds, spec.overlay2))
+            .args(self.rt_args(spec.host_uds, spec.overlay2, spec.platform))
             .args(create_args(spec))
             .output()
             .await?;
@@ -133,9 +135,15 @@ impl Cli {
         }
     }
 
-    pub async fn start(&self, id: &str, host_uds: HostUds, overlay2: &str) -> Result<()> {
+    pub async fn start(
+        &self,
+        id: &str,
+        host_uds: HostUds,
+        overlay2: &str,
+        platform: GVisorPlatform,
+    ) -> Result<()> {
         self.podman()
-            .args(self.rt_args(host_uds, overlay2))
+            .args(self.rt_args(host_uds, overlay2, platform))
             .args(["start", id])
             .output()
             .await?
@@ -167,13 +175,19 @@ impl Cli {
             .check()
     }
 
-    fn rt_args(&self, host_uds: HostUds, overlay2: &str) -> Vec<OsString> {
+    fn rt_args(
+        &self,
+        host_uds: HostUds,
+        overlay2: &str,
+        platform: GVisorPlatform,
+    ) -> Vec<OsString> {
         vec![
             OsString::from("--runtime"),
             self.runtime.as_os_str().to_owned(),
             OsString::from("--runtime-flag=network=none"),
             OsString::from(format!("--runtime-flag=host-uds={host_uds}")),
             OsString::from(format!("--runtime-flag=overlay2={overlay2}")),
+            OsString::from(format!("--runtime-flag=platform={platform}")),
             OsString::from("--runtime-flag=ignore-cgroups"),
         ]
     }
@@ -195,6 +209,7 @@ pub(super) struct Create<'a> {
     pub stop_timeout: Duration,
     pub host_uds: HostUds,
     pub overlay2: &'a str,
+    pub platform: GVisorPlatform,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,10 +235,20 @@ pub struct Labels {
         default = "default_overlay2"
     )]
     pub overlay2: String,
+    #[serde(
+        rename = "io.guardian.sandbox.gvisor.platform",
+        default = "default_platform"
+    )]
+    pub platform: GVisorPlatform,
 }
 
 fn default_overlay2() -> String {
     "root:self".into()
+}
+
+fn default_platform() -> GVisorPlatform {
+    // Containers created before platform selection was persisted used systrap.
+    GVisorPlatform::Systrap
 }
 
 trait OutputExt {

@@ -59,6 +59,7 @@ pub struct Spec {
     pub upstream_dns: Ipv4Addr,
     pub host_uds: HostUds,
     pub overlay2: String,
+    pub platform: GVisorPlatform,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -95,6 +96,38 @@ impl FromStr for HostUds {
             "none" => Ok(Self::None),
             "open" => Ok(Self::Open),
             _ => Err(format!("unsupported host UDS mode {value:?}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GVisorPlatform {
+    Ptrace,
+    Systrap,
+    #[default]
+    Kvm,
+}
+
+impl fmt::Display for GVisorPlatform {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Ptrace => "ptrace",
+            Self::Systrap => "systrap",
+            Self::Kvm => "kvm",
+        })
+    }
+}
+
+impl FromStr for GVisorPlatform {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "ptrace" => Ok(Self::Ptrace),
+            "systrap" => Ok(Self::Systrap),
+            "kvm" => Ok(Self::Kvm),
+            _ => Err(format!("unsupported gVisor platform {value:?}")),
         }
     }
 }
@@ -190,6 +223,7 @@ impl rt::Backend for Podman {
                 stop_timeout: self.context.stop_timeout,
                 host_uds: spec.host_uds,
                 overlay2: &spec.overlay2,
+                platform: spec.platform,
             })
             .await?;
 
@@ -200,6 +234,7 @@ impl rt::Backend for Podman {
             container_id,
             host_uds: spec.host_uds,
             overlay2: spec.overlay2,
+            platform: spec.platform,
             active: None,
         })
     }
@@ -212,6 +247,7 @@ impl rt::Backend for Podman {
             container_id: container.container_id,
             host_uds: container.labels.host_uds,
             overlay2: container.labels.overlay2,
+            platform: container.labels.platform,
             active: None,
         })
     }
@@ -223,6 +259,7 @@ pub struct Sandbox {
     container_id: String,
     host_uds: HostUds,
     overlay2: String,
+    platform: GVisorPlatform,
     active: Option<Active>,
 }
 
@@ -259,7 +296,12 @@ impl rt::Sandbox for Sandbox {
         )?;
         self.context
             .cli
-            .start(&self.container_id, self.host_uds, &self.overlay2)
+            .start(
+                &self.container_id,
+                self.host_uds,
+                &self.overlay2,
+                self.platform,
+            )
             .await?;
 
         info!(sandbox_id = %self.id, container_id = %self.container_id, "sandbox started");
@@ -648,6 +690,7 @@ mod tests {
             container_id: sandbox.container_id.clone(),
             host_uds: sandbox.host_uds,
             overlay2: sandbox.overlay2.clone(),
+            platform: sandbox.platform,
             active: None,
         }
     }
@@ -730,6 +773,7 @@ mod tests {
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::Open,
                 overlay2: "root:self".into(),
+                platform: GVisorPlatform::Kvm,
             })
             .await
             .unwrap();
@@ -807,6 +851,7 @@ mod tests {
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::None,
                 overlay2: "root:self".into(),
+                platform: GVisorPlatform::Kvm,
             })
             .await
             .unwrap();
@@ -871,6 +916,7 @@ mod tests {
                 upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
                 host_uds: HostUds::None,
                 overlay2: "root:self".into(),
+                platform: GVisorPlatform::Kvm,
             })
             .await
             .unwrap();

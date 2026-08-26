@@ -176,6 +176,10 @@ pub struct CreateArgs {
     /// gVisor filesystem overlay configuration.
     #[arg(long, default_value = "root:self")]
     pub gvisor_overlay2: String,
+
+    /// gVisor execution platform.
+    #[arg(long = "gvisor-platform", default_value_t = podman::GVisorPlatform::Kvm)]
+    pub gvisor_platform: podman::GVisorPlatform,
 }
 
 #[derive(Debug, clap::Args)]
@@ -213,6 +217,7 @@ impl CreateArgs {
             upstream_dns: self.upstream_dns,
             host_uds: self.network,
             overlay2: self.gvisor_overlay2,
+            platform: self.gvisor_platform,
         }
     }
 }
