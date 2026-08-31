@@ -74,10 +74,13 @@ async fn run(mut backend: Podman, command: Command) -> Result<ExitCode> {
         Command::Run {
             create,
             exec,
+            egress,
             ephemeral,
         } => {
+            let policy = egress.into_policy()?;
             let exec = exec.into_spec();
             let mut sandbox = backend.create(create.into_spec()).await?;
+            sandbox.set_net_policy(policy);
             let id = sandbox.id();
             eprintln!("guardian: sandbox {id}");
             let result = async {
@@ -110,8 +113,10 @@ async fn run(mut backend: Podman, command: Command) -> Result<ExitCode> {
             }
             result
         }
-        Command::Start { id } => {
+        Command::Start { id, egress } => {
+            let policy = egress.into_policy()?;
             let mut sandbox = backend.get(id).await?;
+            sandbox.set_net_policy(policy);
             sandbox.start().await?;
             sandbox.join().await?;
             Ok(ExitCode::SUCCESS)

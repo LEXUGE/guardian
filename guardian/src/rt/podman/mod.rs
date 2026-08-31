@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
-    net::uds,
+    net::{policy::Policy, uds},
     rt::{self, Stdio},
 };
 
@@ -136,7 +136,7 @@ struct Context {
     cli: Cli,
     exec: Arc<api::ExecApi>,
     root: Root,
-    proxy: uds::Config,
+    connect_timeout: Duration,
     stop_timeout: Duration,
 }
 
@@ -164,9 +164,7 @@ impl rt::Backend for Podman {
                 cli: Cli::new(config.podman, config.runtime),
                 exec: Arc::new(api::ExecApi::new(config.socket)?),
                 root,
-                proxy: uds::Config {
-                    connect_timeout: config.connect_timeout,
-                },
+                connect_timeout: config.connect_timeout,
                 stop_timeout: config.stop_timeout,
             }),
         })
@@ -235,6 +233,7 @@ impl rt::Backend for Podman {
             host_uds: spec.host_uds,
             overlay2: spec.overlay2,
             platform: spec.platform,
+            net_policy: Policy::default(),
             active: None,
         })
     }
@@ -248,6 +247,7 @@ impl rt::Backend for Podman {
             host_uds: container.labels.host_uds,
             overlay2: container.labels.overlay2,
             platform: container.labels.platform,
+            net_policy: Policy::default(),
             active: None,
         })
     }
@@ -260,7 +260,14 @@ pub struct Sandbox {
     host_uds: HostUds,
     overlay2: String,
     platform: GVisorPlatform,
+    net_policy: Policy,
     active: Option<Active>,
+}
+
+impl Sandbox {
+    pub fn set_net_policy(&mut self, policy: Policy) {
+        self.net_policy = policy;
+    }
 }
 
 impl rt::Sandbox for Sandbox {
@@ -292,7 +299,10 @@ impl rt::Sandbox for Sandbox {
         let proxy = ProxyTask::spawn(
             self.host_uds,
             &state.proxy_socket(),
-            self.context.proxy.clone(),
+            uds::Config {
+                connect_timeout: self.context.connect_timeout,
+                policy: self.net_policy.clone(),
+            },
         )?;
         self.context
             .cli
@@ -691,6 +701,7 @@ mod tests {
             host_uds: sandbox.host_uds,
             overlay2: sandbox.overlay2.clone(),
             platform: sandbox.platform,
+            net_policy: sandbox.net_policy.clone(),
             active: None,
         }
     }

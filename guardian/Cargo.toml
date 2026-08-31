@@ -8,6 +8,7 @@ fast-socks5 = "1.0.0"
 futures = "0.3"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+ipnet = { version = "2.12", features = ["serde"] }
 podman-rest-client = { version = "0.13", default-features = false, features = ["uds", "v5"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -19,3 +20,4 @@ uuid = { version = "1.20.0", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+toml = "1"

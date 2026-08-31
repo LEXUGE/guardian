@@ -4,6 +4,7 @@ use std::{
     fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -11,26 +12,38 @@ use fast_socks5::{
     ReplyError, Socks5Command, server::Socks5ServerProtocol, util::target_addr::TargetAddr,
 };
 use tokio::{
-    net::{TcpStream, UnixListener, UnixStream},
+    net::{TcpStream, UnixListener, UnixStream, lookup_host},
     sync::watch,
     task::JoinSet,
     time::timeout,
 };
 use tracing::{info, warn};
 
-use crate::Result;
+use crate::{Result, net::policy::Policy};
 
 const MAX_CONNECTIONS: usize = 256;
+
+enum ConnectError {
+    Denied,
+    Io(io::Error),
+}
+
+impl From<io::Error> for ConnectError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub connect_timeout: Duration,
+    pub policy: Policy,
 }
 
 pub struct Proxy {
     listener: UnixListener,
     bind_path: PathBuf,
-    config: Config,
+    config: Arc<Config>,
 }
 
 impl Proxy {
@@ -40,7 +53,7 @@ impl Proxy {
         Ok(Self {
             listener,
             bind_path: path.to_owned(),
-            config,
+            config: Arc::new(config),
         })
     }
 
@@ -56,9 +69,9 @@ impl Proxy {
                         continue;
                     }
                     let bind_path = self.bind_path.clone();
-                    let connect_timeout = self.config.connect_timeout;
+                    let config = Arc::clone(&self.config);
                     connections.spawn(async move {
-                        if let Err(error) = Self::connection(stream, connect_timeout, &bind_path).await {
+                        if let Err(error) = Self::connection(stream, &config, &bind_path).await {
                             warn!(bind_path = %bind_path.display(), %error, "SOCKS connection failed");
                         }
                     });
@@ -81,11 +94,7 @@ impl Proxy {
         Ok(())
     }
 
-    async fn connection(
-        stream: UnixStream,
-        connect_timeout: Duration,
-        bind_path: &Path,
-    ) -> Result<()> {
+    async fn connection(stream: UnixStream, config: &Config, bind_path: &Path) -> Result<()> {
         let protocol = Socks5ServerProtocol::accept_no_auth(stream).await?;
         let (protocol, command, target) = protocol.read_command().await?;
         if command != Socks5Command::TCPConnect {
@@ -101,17 +110,21 @@ impl Proxy {
             "SOCKS connection started"
         );
 
-        let connect = async {
-            match &target {
-                TargetAddr::Ip(address) => TcpStream::connect(address).await,
-                TargetAddr::Domain(domain, port) => {
-                    TcpStream::connect((domain.as_str(), *port)).await
-                }
+        let (mut outbound, remote) = match timeout(
+            config.connect_timeout,
+            Self::connect(&target, &config.policy),
+        )
+        .await
+        {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(ConnectError::Denied)) => {
+                info!(bind_path = %bind_path.display(), ?target, "SOCKS connection denied");
+                protocol
+                    .reply_error(&ReplyError::ConnectionNotAllowed)
+                    .await?;
+                return Ok(());
             }
-        };
-        let mut outbound = match timeout(connect_timeout, connect).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => {
+            Ok(Err(ConnectError::Io(error))) => {
                 protocol.reply_error(&ReplyError::GeneralFailure).await?;
                 return Err(error.into());
             }
@@ -129,11 +142,35 @@ impl Proxy {
         info!(
             bind_path = %bind_path.display(),
             ?target,
+            %remote,
             guest_to_host,
             host_to_guest,
             "SOCKS connection stopped"
         );
         Ok(())
+    }
+
+    async fn connect(
+        target: &TargetAddr,
+        policy: &Policy,
+    ) -> std::result::Result<(TcpStream, std::net::SocketAddr), ConnectError> {
+        let remote = match target {
+            TargetAddr::Ip(address) => policy
+                .cidrs
+                .allows(address.ip(), address.port())
+                .then_some(*address)
+                .ok_or(ConnectError::Denied)?,
+            TargetAddr::Domain(domain, port) => {
+                if !policy.domains.allows(domain, *port) {
+                    return Err(ConnectError::Denied);
+                }
+                lookup_host((domain.as_str(), *port))
+                    .await?
+                    .find(|address| !policy.cidrs.denies(address.ip(), *port))
+                    .ok_or(ConnectError::Denied)?
+            }
+        };
+        Ok((TcpStream::connect(remote).await?, remote))
     }
 }
 
@@ -156,6 +193,7 @@ mod tests {
             &socket_path,
             Config {
                 connect_timeout: Duration::from_secs(1),
+                policy: toml::from_str("[cidrs]\nallow = ['127.0.0.0/8']").unwrap(),
             },
         )
         .unwrap();

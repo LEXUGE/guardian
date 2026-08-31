@@ -1,7 +1,7 @@
-use std::{ffi::OsString, net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{ffi::OsString, fs, net::Ipv4Addr, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand};
-use guardian::{Error, Result, rt::podman};
+use guardian::{Error, Result, net::policy::Policy, rt::podman};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -119,13 +119,21 @@ pub enum Command {
         #[command(flatten)]
         exec: ExecArgs,
 
+        #[command(flatten)]
+        egress: EgressArgs,
+
         /// Remove the sandbox after the command exits.
         #[arg(long, default_value_t = true)]
         ephemeral: bool,
     },
 
     /// Start a sandbox and own it until interrupted.
-    Start { id: Uuid },
+    Start {
+        id: Uuid,
+
+        #[command(flatten)]
+        egress: EgressArgs,
+    },
 
     /// Execute one command in a running sandbox.
     Exec {
@@ -146,6 +154,33 @@ pub enum Command {
 
     /// List Guardian-managed containers as JSON.
     List,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct EgressArgs {
+    /// TOML network policy for this sandbox run.
+    #[arg(long, value_name = "PATH")]
+    pub net_policy: Option<PathBuf>,
+}
+
+impl EgressArgs {
+    pub fn into_policy(self) -> Result<Policy> {
+        let Some(path) = self.net_policy else {
+            return Ok(Policy::default());
+        };
+        let source = fs::read_to_string(&path).map_err(|error| {
+            Error::Config(format!(
+                "cannot read network policy {}: {error}",
+                path.display()
+            ))
+        })?;
+        toml::from_str(&source).map_err(|error| {
+            Error::Config(format!(
+                "invalid network policy {}: {error}",
+                path.display()
+            ))
+        })
+    }
 }
 
 #[derive(Debug, clap::Args)]

@@ -7,7 +7,7 @@ While it aims to support generic sandbox backends, currently the implementation 
 It aims to be simple so you could review the code and customize.
 
 > [!WARNING]
-> The project is currently a prototype. Currently the network proxy is "log-only" and enforces no filtering. In particular it's possible for guest to access local services. Use `--network=none` if needed.
+> The project is currently a prototype. Currently the network proxy rejects any remote with a reserved/special purpose IP address. Use `--network=none` to completely disable network if required.
 
 ## Quickstart
 
