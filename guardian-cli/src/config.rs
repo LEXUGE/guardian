@@ -1,4 +1,10 @@
-use std::{ffi::OsString, fs, net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{
+    ffi::OsString,
+    fs,
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use clap::{Parser, Subcommand};
 use guardian::{Error, Result, net::policy::Policy, rt::podman};
@@ -160,26 +166,43 @@ pub enum Command {
 pub struct EgressArgs {
     /// TOML network policy for this sandbox run.
     #[arg(long, value_name = "PATH")]
-    pub net_policy: Option<PathBuf>,
+    pub net_policy: Vec<PathBuf>,
 }
 
 impl EgressArgs {
     pub fn into_policy(self) -> Result<Policy> {
-        let Some(path) = self.net_policy else {
+        if self.net_policy.is_empty() {
             return Ok(Policy::default());
-        };
-        let source = fs::read_to_string(&path).map_err(|error| {
-            Error::Config(format!(
-                "cannot read network policy {}: {error}",
-                path.display()
-            ))
-        })?;
-        toml::from_str(&source).map_err(|error| {
-            Error::Config(format!(
-                "invalid network policy {}: {error}",
-                path.display()
-            ))
-        })
+        }
+
+        let mut errors = Vec::new();
+        let policy = self.net_policy.into_iter().find_map(|path| {
+            if path == Path::new("default") {
+                return Some(Policy::default());
+            }
+            let source = match fs::read_to_string(&path) {
+                Ok(source) => source,
+                Err(error) => {
+                    errors.push(format!(
+                        "cannot read network policy {}: {error}",
+                        path.display()
+                    ));
+                    return None;
+                }
+            };
+            match toml::from_str(&source) {
+                Ok(policy) => Some(policy),
+                Err(error) => {
+                    errors.push(format!(
+                        "invalid network policy {}: {error}",
+                        path.display()
+                    ));
+                    None
+                }
+            }
+        });
+
+        policy.ok_or_else(|| Error::Config(errors.join("; ")))
     }
 }
 
@@ -361,5 +384,83 @@ mod tests {
         .unwrap();
         let error = cli.runtime.into_config().unwrap_err();
         assert!(error.to_string().contains("socket path is not absolute"));
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("guardian-cli-{}", Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn into_policy(paths: impl IntoIterator<Item = PathBuf>) -> Result<Policy> {
+        EgressArgs {
+            net_policy: paths.into_iter().collect(),
+        }
+        .into_policy()
+    }
+
+    #[test]
+    fn selects_first_successful_policy() {
+        let dir = TempDir::new();
+        let file1 = dir.path().join("file1");
+        let file2 = dir.path().join("file2");
+        let file3 = dir.path().join("file3");
+        // file1 exists but contains malformed TOML.
+        fs::write(&file1, "[").unwrap();
+        // file2 is a directory, so it cannot be read as a policy file.
+        fs::create_dir(&file2).unwrap();
+        let source = "[domains]\nallow = [\"example.com\"]";
+        fs::write(&file3, source).unwrap();
+
+        let policy = into_policy([file1, file2, file3, PathBuf::from("default")]).unwrap();
+        let expected: Policy = toml::from_str(source).unwrap();
+        assert_eq!(format!("{policy:?}"), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn selects_default_after_unsuccessful_policies() {
+        let dir = TempDir::new();
+        let file1 = dir.path().join("file1");
+        let file2 = dir.path().join("file2");
+        // file1 exists but contains malformed TOML.
+        fs::write(&file1, "[").unwrap();
+        // file2 is a directory, so it cannot be read as a policy file.
+        fs::create_dir(&file2).unwrap();
+
+        let policy = into_policy([file1, file2, PathBuf::from("default")]).unwrap();
+        assert_eq!(format!("{policy:?}"), format!("{:?}", Policy::default()));
+    }
+
+    #[test]
+    fn returns_error_when_no_policy_succeeds() {
+        let dir = TempDir::new();
+        let file1 = dir.path().join("file1");
+        let file2 = dir.path().join("file2");
+        // file1 exists but contains malformed TOML.
+        fs::write(&file1, "[").unwrap();
+        // file2 is a directory, so it cannot be read as a policy file.
+        fs::create_dir(&file2).unwrap();
+
+        assert!(into_policy([file1, file2]).is_err());
+    }
+
+    #[test]
+    fn selects_default_without_policy_arguments() {
+        let policy = into_policy([]).unwrap();
+        assert_eq!(format!("{policy:?}"), format!("{:?}", Policy::default()));
     }
 }
