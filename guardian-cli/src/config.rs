@@ -246,6 +246,14 @@ pub struct ExecArgs {
     #[arg(short = 't', long)]
     pub tty: bool,
 
+    /// Environment variable override for this command. May be repeated.
+    #[arg(short = 'e', long, value_name = "KEY=VALUE", value_parser = parse_env)]
+    pub env: Vec<String>,
+
+    /// Absolute guest working directory for this command.
+    #[arg(short = 'w', long = "workdir", value_name = "PATH", value_parser = parse_workdir)]
+    pub working_dir: Option<String>,
+
     /// Command and arguments. Defaults to /bin/sh.
     #[arg(
         trailing_var_arg = true,
@@ -259,9 +267,26 @@ impl ExecArgs {
     pub fn into_spec(self) -> podman::ExecSpec {
         podman::ExecSpec {
             command: self.command,
+            env: self.env,
             tty: self.tty,
+            working_dir: self.working_dir,
             ..Default::default()
         }
+    }
+}
+
+fn parse_env(value: &str) -> std::result::Result<String, String> {
+    match value.split_once('=') {
+        Some((key, _)) if !key.is_empty() => Ok(value.to_owned()),
+        _ => Err("expected KEY=VALUE with a nonempty key".into()),
+    }
+}
+
+fn parse_workdir(value: &str) -> std::result::Result<String, String> {
+    if Path::new(value).is_absolute() {
+        Ok(value.to_owned())
+    } else {
+        Err("working directory must be an absolute guest path".into())
     }
 }
 
@@ -308,6 +333,50 @@ mod tests {
         };
         assert!(exec.tty);
         assert_eq!(exec.command, ["bash"]);
+    }
+
+    #[test]
+    fn exec_environment_and_workdir_are_forwarded() {
+        let cli = Cli::try_parse_from([
+            "guardian",
+            "exec",
+            "00000000-0000-0000-0000-000000000001",
+            "--env",
+            "HOME=/home/agent",
+            "--env",
+            "EMPTY=",
+            "--env",
+            "TOKEN=a=b",
+            "--workdir",
+            "/workspace",
+        ])
+        .unwrap();
+        let Command::Exec { exec, .. } = cli.command else {
+            panic!("expected exec command");
+        };
+        let spec = exec.into_spec();
+        assert_eq!(spec.env, ["HOME=/home/agent", "EMPTY=", "TOKEN=a=b"]);
+        assert_eq!(spec.working_dir.as_deref(), Some("/workspace"));
+    }
+
+    #[test]
+    fn exec_rejects_invalid_overrides() {
+        for (option, value) in [
+            ("--env", "HOME"),
+            ("--env", "=value"),
+            ("--workdir", "workspace"),
+            ("--workdir", ""),
+        ] {
+            let error = Cli::try_parse_from([
+                "guardian",
+                "exec",
+                "00000000-0000-0000-0000-000000000001",
+                option,
+                value,
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
     }
 
     #[test]

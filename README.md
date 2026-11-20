@@ -65,6 +65,8 @@ Some useful options:
 - Pass `--ephemeral` (default to true) to `run` to remove its sandbox after the command exits.
 - Command stdin, stdout, and stderr are inherited. Pass `-t`/`--tty` to
   allocate a guest terminal.
+- For `exec` and `run`, pass `--env KEY=VALUE` (repeatable) and
+  `--workdir /guest/path` before the command for per-command overrides.
 - Pass `--name NAME` to `create` or `run` to specify exact Podman container name.
 - Pass `--mount SPEC` repeatedly to forward Podman mount specifications at sandbox creation. For example, `--mount type=bind,source=./workspace,destination=/workspace` persists guest writes in `./workspace`.
 - Pass `--volume SPEC` repeatedly to forward Podman volume specifications at sandbox creation. For example, `--volume ./workspace:/workspace` persists guest writes in `./workspace`.
