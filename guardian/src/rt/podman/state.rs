@@ -7,8 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use sha2::{Digest, Sha256};
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::{Error, Result};
 
@@ -18,6 +18,13 @@ const NSSWITCH: &str = "passwd: files\ngroup: files\nshadow: files\nhosts: files
 
 pub struct Root {
     path: PathBuf,
+}
+
+fn key(id: &str) -> String {
+    // Use 128 bits to leave room for the Unix socket path.
+    let mut key = format!("{:x}", Sha256::digest(id.as_bytes()));
+    key.truncate(32);
+    key
 }
 
 #[derive(Debug)]
@@ -75,7 +82,11 @@ impl Root {
         Ok(Self { path })
     }
 
-    pub fn create(&self, id: Option<Uuid>) -> Result<State> {
+    pub fn path(&self, id: &str) -> PathBuf {
+        self.path.join(key(id))
+    }
+
+    pub fn create(&self, id: &str) -> Result<State> {
         fn write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
             let mut file = OpenOptions::new()
                 .write(true)
@@ -89,10 +100,8 @@ impl Root {
             Ok(())
         }
 
-        let id = id.unwrap_or_else(Uuid::new_v4);
         let state = State {
-            id,
-            path: self.path.join(id.simple().to_string()),
+            path: self.path(id),
             _lock: self.acquire(id)?,
         };
 
@@ -124,8 +133,8 @@ impl Root {
         Ok(state)
     }
 
-    pub fn acquire(&self, id: Uuid) -> Result<Lock> {
-        let path = self.path.join(format!(".{}.lock", id.simple()));
+    pub fn acquire(&self, id: &str) -> Result<Lock> {
+        let path = self.path.join(format!(".{}.lock", key(id)));
         let lock = OpenOptions::new()
             .truncate(true)
             .create(true)
@@ -143,7 +152,7 @@ impl Root {
         }
     }
 
-    pub fn is_acquired(&self, id: Uuid) -> Result<bool> {
+    pub fn is_acquired(&self, id: &str) -> Result<bool> {
         match self.acquire(id) {
             Ok(lock) => {
                 drop(lock);
@@ -157,16 +166,11 @@ impl Root {
 
 #[derive(Debug)]
 pub struct State {
-    id: Uuid,
     path: PathBuf,
     _lock: Lock,
 }
 
 impl State {
-    pub fn id(&self) -> Uuid {
-        self.id
-    }
-
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -216,7 +220,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("guardian");
         let root = Root::open(root_path.clone()).unwrap();
-        let state = root.create(None).unwrap();
+        let id = "sandbox";
+        let state = root.create(id).unwrap();
 
         assert_eq!(
             fs::read_to_string(state.resolv_conf()).unwrap(),
@@ -257,11 +262,10 @@ mod tests {
             0o555
         );
 
-        let id = state.id();
         let path = state.path().to_owned();
         drop(state);
         assert!(!path.exists());
-        let lock = root_path.join(format!(".{}.lock", id.simple()));
+        let lock = root_path.join(format!(".{}.lock", key(id)));
         assert_eq!(
             fs::metadata(lock).unwrap().permissions().mode() & 0o777,
             0o600
@@ -282,10 +286,10 @@ mod tests {
         let path = temp.path().join("guardian");
         let first = Root::open(path.clone()).unwrap();
         let second = Root::open(path).unwrap();
-        let id = Uuid::new_v4();
-        let state = first.create(Some(id)).unwrap();
+        let id = "sandbox";
+        let state = first.create(id).unwrap();
 
-        assert!(matches!(second.create(Some(id)), Err(Error::Busy(_))));
+        assert!(matches!(second.create(id), Err(Error::Busy(_))));
         assert!(second.is_acquired(id).unwrap());
         assert!(state.resolv_conf().exists());
         drop(state);
@@ -296,8 +300,8 @@ mod tests {
     fn explicit_unlock_on_drop() {
         let temp = tempfile::tempdir().unwrap();
         let root = Root::open(temp.path().join("guardian")).unwrap();
-        let id = Uuid::new_v4();
-        let state = root.create(Some(id)).unwrap();
+        let id = "sandbox";
+        let state = root.create(id).unwrap();
         let inherited = state._lock.0.try_clone().unwrap();
 
         drop(state);
@@ -312,8 +316,8 @@ mod tests {
         let path = temp.path().join("guardian");
         let first = Root::open(path.clone()).unwrap();
         let second = Root::open(path).unwrap();
-        let first_state = first.create(Some(Uuid::new_v4())).unwrap();
-        let second_state = second.create(Some(Uuid::new_v4())).unwrap();
+        let first_state = first.create("first").unwrap();
+        let second_state = second.create("second").unwrap();
 
         assert_ne!(first_state.path(), second_state.path());
         assert!(first_state.resolv_conf().exists());
@@ -328,11 +332,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("guardian");
         let root = Root::open(path.clone()).unwrap();
-        let id = Uuid::new_v4();
-        let state_path = path.join(id.simple().to_string());
+        let id = "sandbox";
+        let state_path = root.path(id);
         fs::create_dir(&state_path).unwrap();
 
-        let state = root.create(Some(id)).unwrap();
+        let state = root.create(id).unwrap();
         assert!(state.resolv_conf().exists());
         assert!(state.hosts().exists());
         assert!(state.nsswitch_conf().exists());
@@ -344,12 +348,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("guardian");
         let root = Root::open(path.clone()).unwrap();
-        let stale = path.join(Uuid::new_v4().simple().to_string());
+        let stale = root.path("stale");
         let unrelated = path.join("not-a-sandbox");
         fs::create_dir(&stale).unwrap();
         fs::create_dir(&unrelated).unwrap();
 
-        let _state = root.create(None).unwrap();
+        let _state = root.create("sandbox").unwrap();
 
         assert!(stale.exists());
         assert!(unrelated.exists());

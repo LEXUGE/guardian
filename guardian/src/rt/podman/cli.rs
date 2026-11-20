@@ -2,13 +2,11 @@ use std::{ffi::OsString, path::PathBuf, process::Output, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use uuid::Uuid;
 
 use super::{GVisorPlatform, HostUds, Status};
 use crate::{Error, Result};
 
 const MANAGED_LABEL: &str = "io.guardian.managed=true";
-const SANDBOX_ID_LABEL: &str = "io.guardian.sandbox.id";
 const HOST_UDS_LABEL: &str = "io.guardian.sandbox.gvisor.host-uds";
 const OVERLAY2_LABEL: &str = "io.guardian.sandbox.gvisor.overlay2";
 const PLATFORM_LABEL: &str = "io.guardian.sandbox.gvisor.platform";
@@ -28,9 +26,8 @@ impl Cli {
         fn create_args(spec: &Create<'_>) -> Vec<OsString> {
             let mut args = vec![
                 OsString::from("create"),
-                OsString::from(format!("--name={}", spec.name)),
+                OsString::from(format!("--name={}", spec.id)),
                 OsString::from(format!("--label={MANAGED_LABEL}")),
-                OsString::from(format!("--label={SANDBOX_ID_LABEL}={}", spec.sandbox_id)),
                 OsString::from(format!("--label={HOST_UDS_LABEL}={}", spec.host_uds)),
                 OsString::from(format!("--label={OVERLAY2_LABEL}={}", spec.overlay2)),
                 OsString::from(format!("--label={PLATFORM_LABEL}={}", spec.platform)),
@@ -83,32 +80,28 @@ impl Cli {
     }
 
     pub async fn list(&self) -> Result<Vec<Container>> {
-        self.list_filtered(None).await
-    }
-
-    async fn list_filtered(&self, sandbox_id: Option<&str>) -> Result<Vec<Container>> {
-        let mut command = self.podman();
-        command.args([
-            "ps",
-            "--all",
-            "--no-trunc",
-            "--filter=label=io.guardian.managed=true",
-        ]);
-        if let Some(sandbox_id) = sandbox_id {
-            command.arg(format!("--filter=label={SANDBOX_ID_LABEL}={sandbox_id}"));
-        }
-        let output = command.arg("--format=json").output().await?;
+        let output = self
+            .podman()
+            .args([
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--filter=label=io.guardian.managed=true",
+                "--format=json",
+            ])
+            .output()
+            .await?;
         output.check()?;
         serde_json::from_slice(&output.stdout)
             .map_err(|error| Error::Podman(format!("invalid container list: {error}")))
     }
 
-    pub async fn get(&self, id: Uuid) -> Result<Container> {
-        let mut containers = self.list_filtered(Some(&id.to_string())).await?;
-        let container = containers
-            .pop()
-            .ok_or_else(|| Error::Podman(format!("sandbox {id} does not exist")))?;
-        Ok(container)
+    pub async fn get(&self, id: &str) -> Result<Container> {
+        self.list()
+            .await?
+            .into_iter()
+            .find(|container| container.names.first().is_some_and(|name| name == id))
+            .ok_or_else(|| Error::Podman(format!("sandbox {id} does not exist")))
     }
 
     pub async fn status(&self, id: &str) -> Result<Status> {
@@ -198,8 +191,7 @@ impl Cli {
 }
 
 pub(super) struct Create<'a> {
-    pub name: &'a str,
-    pub sandbox_id: Uuid,
+    pub id: &'a str,
     pub mounts: &'a [String],
     pub user_mounts: &'a [OsString],
     pub user_volumes: &'a [OsString],
@@ -226,8 +218,6 @@ pub struct Container {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Labels {
-    #[serde(rename = "io.guardian.sandbox.id")]
-    pub id: Uuid,
     #[serde(rename = "io.guardian.sandbox.gvisor.host-uds", default)]
     pub host_uds: HostUds,
     #[serde(
@@ -276,21 +266,17 @@ mod tests {
     async fn get_deserializes_sandbox_labels() {
         let mock = MockPodman::new();
         mock.set_containers(
-            r#"[{"Names":["container-name","alias"],"Image":"example:latest","Id":"container-id","Labels":{"io.guardian.sandbox.id":"00000000-0000-0000-0000-000000000001","io.guardian.sandbox.gvisor.host-uds":"none","io.guardian.sandbox.gvisor.overlay2":"root:dir=/run/guardian","other.label":"ignored"}}]"#,
+            r#"[{"Names":["container-name"],"Image":"example:latest","Id":"container-id","Labels":{"io.guardian.managed":"true","io.guardian.sandbox.gvisor.host-uds":"none","io.guardian.sandbox.gvisor.overlay2":"root:dir=/run/guardian","other.label":"ignored"}}]"#,
         );
 
         let container = Cli::new(mock.binary(), "runsc".into())
-            .get(Uuid::new_v4())
+            .get("container-name")
             .await
             .unwrap();
 
-        assert_eq!(container.names, ["container-name", "alias"]);
+        assert_eq!(container.names, ["container-name"]);
         assert_eq!(container.image, "example:latest");
         assert_eq!(container.container_id, "container-id");
-        assert_eq!(
-            container.labels.id,
-            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
-        );
         assert_eq!(container.labels.host_uds, HostUds::None);
         assert_eq!(container.labels.overlay2, "root:dir=/run/guardian");
     }

@@ -19,7 +19,6 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::{
     Error, Result,
@@ -52,7 +51,8 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub struct Spec {
-    pub name: Option<String>,
+    /// Sandbox ID and Podman container name. Generated when omitted.
+    pub id: Option<String>,
     pub mounts: Vec<OsString>,
     pub volumes: Vec<OsString>,
     pub image: String,
@@ -154,7 +154,7 @@ impl Podman {
 impl rt::Backend for Podman {
     type Config = Config;
     type Spec = Spec;
-    type Id = Uuid;
+    type Id = String;
     type Sandbox = Sandbox;
 
     async fn init(config: Self::Config) -> Result<Self> {
@@ -171,8 +171,19 @@ impl rt::Backend for Podman {
     }
 
     async fn create(&mut self, spec: Self::Spec) -> Result<Self::Sandbox> {
-        let state = self.context.root.create(None)?;
-        let id = state.id();
+        let id = match spec.id {
+            Some(id) => id,
+            None => {
+                let mut bytes = [0; 16];
+                getrandom::fill(&mut bytes).map_err(std::io::Error::from)?;
+                format!("guardian-{:032x}", u128::from_be_bytes(bytes))
+            }
+        };
+        // Podman generates a name for empty input instead of rejecting it.
+        if id.is_empty() {
+            return Err(Error::Config("sandbox ID cannot be empty".into()));
+        }
+        let state = self.context.root.create(&id)?;
         let mounts = [
             (state.path().to_owned(), "/run/guardian"),
             (state.resolv_conf(), "/etc/resolv.conf"),
@@ -203,15 +214,11 @@ impl rt::Backend for Podman {
         }
 
         let command = [OsString::from(BOOTSTRAP)];
-        let name = spec
-            .name
-            .unwrap_or_else(|| format!("guardian-{}", id.simple()));
         let container_id = self
             .context
             .cli
             .create(&Create {
-                name: &name,
-                sandbox_id: id,
+                id: &id,
                 mounts: &mounts,
                 user_mounts: &spec.mounts,
                 user_volumes: &spec.volumes,
@@ -238,11 +245,11 @@ impl rt::Backend for Podman {
         })
     }
 
-    async fn get(&self, id: Uuid) -> Result<Self::Sandbox> {
-        let container = self.context.cli.get(id).await?;
+    async fn get(&self, id: String) -> Result<Self::Sandbox> {
+        let container = self.context.cli.get(&id).await?;
         Ok(Sandbox {
             context: Arc::clone(&self.context),
-            id: container.labels.id,
+            id,
             container_id: container.container_id,
             host_uds: container.labels.host_uds,
             overlay2: container.labels.overlay2,
@@ -255,7 +262,7 @@ impl rt::Backend for Podman {
 
 pub struct Sandbox {
     context: Arc<Context>,
-    id: Uuid,
+    id: String,
     container_id: String,
     host_uds: HostUds,
     overlay2: String,
@@ -271,13 +278,13 @@ impl Sandbox {
 }
 
 impl rt::Sandbox for Sandbox {
-    type Id = Uuid;
+    type Id = String;
     type Process = Process;
     type ExecSpec = ExecSpec;
     type Status = Status;
 
-    fn id(&self) -> Uuid {
-        self.id
+    fn id(&self) -> String {
+        self.id.clone()
     }
 
     async fn status(&self) -> Result<Self::Status> {
@@ -295,7 +302,7 @@ impl rt::Sandbox for Sandbox {
             }
         }
 
-        let state = self.context.root.create(Some(self.id))?;
+        let state = self.context.root.create(&self.id)?;
         let proxy = ProxyTask::spawn(
             self.host_uds,
             &state.proxy_socket(),
@@ -328,7 +335,7 @@ impl rt::Sandbox for Sandbox {
     async fn exec(&self, spec: ExecSpec, stdio: Stdio) -> Result<Self::Process> {
         // we should NOT check if active is Some since it could be managed by another `Sandbox`
         // instance.
-        if !self.context.root.is_acquired(self.id)? {
+        if !self.context.root.is_acquired(&self.id)? {
             return Err(Error::Podman(format!(
                 "sandbox {} has no running Guardian owner",
                 self.id
@@ -375,7 +382,7 @@ impl rt::Sandbox for Sandbox {
     async fn remove(self) -> Result<()> {
         // makes sure there are no other `Sandbox` instance owning the state
         // and prevents another instance starting the sandbox while we remove it
-        let _lock = self.context.root.acquire(self.id)?;
+        let _lock = self.context.root.acquire(&self.id)?;
         self.context.cli.remove(&self.container_id).await
     }
 }
@@ -696,7 +703,7 @@ mod tests {
     fn another_instance(sandbox: &Sandbox) -> Sandbox {
         Sandbox {
             context: Arc::clone(&sandbox.context),
-            id: sandbox.id,
+            id: sandbox.id.clone(),
             container_id: sandbox.container_id.clone(),
             host_uds: sandbox.host_uds,
             overlay2: sandbox.overlay2.clone(),
@@ -777,7 +784,7 @@ mod tests {
         .unwrap();
         let mut sandbox = backend
             .create(Spec {
-                name: None,
+                id: None,
                 mounts: vec![OsString::from("type=volume,destination=/workspace,ro")],
                 volumes: vec![OsString::from("cache:/cache:ro")],
                 image: "example/image".into(),
@@ -788,7 +795,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let state = root.join(sandbox.id().simple().to_string());
+        let state = backend.context.root.path(&sandbox.id());
         assert!(!state.exists());
 
         let mut second = another_instance(&sandbox);
@@ -840,7 +847,7 @@ mod tests {
     async fn missing_host_uds_defaults_to_disabled() {
         let mock = MockPodman::new();
         mock.set_containers(
-            r#"[{"Names":["test-container"],"Image":"example/image","Id":"test-container","Labels":{"io.guardian.sandbox.id":"00000000-0000-0000-0000-000000000001"}}]"#,
+            r#"[{"Names":["test-container"],"Image":"example/image","Id":"test-container","Labels":{"io.guardian.managed":"true"}}]"#,
         );
         let root = mock.state_root();
         let mut backend = Podman::init(Config {
@@ -855,7 +862,7 @@ mod tests {
         .unwrap();
         let sandbox = backend
             .create(Spec {
-                name: None,
+                id: Some("test-container".into()),
                 mounts: Vec::new(),
                 volumes: Vec::new(),
                 image: "example/image".into(),
@@ -870,7 +877,7 @@ mod tests {
         drop(sandbox);
 
         let mut sandbox = backend.get(id).await.unwrap();
-        let state = root.join(sandbox.id().simple().to_string());
+        let state = backend.context.root.path(&sandbox.id());
         sandbox.start().await.unwrap();
         assert!(state.exists());
         assert!(!state.join("proxy.sock").exists());
@@ -920,7 +927,7 @@ mod tests {
         .unwrap();
         let mut sandbox = backend
             .create(Spec {
-                name: None,
+                id: None,
                 mounts: vec![OsString::from("type=volume,destination=/readonly,ro")],
                 volumes: Vec::new(),
                 image: "alpine:3.23.5".into(),

@@ -19,7 +19,7 @@ You would need:
 ```sh
 nix develop
 podman build -t guardian-demo examples/demo-image
-cargo run -p guardian-cli -- run --ephemeral guardian-demo curl https://example.com
+cargo run -p guardian-cli -- run guardian-demo curl https://example.com
 ```
 
 Guardian CLI exposes several commands:
@@ -38,6 +38,8 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 ```
 
+`create` and `run` accept `--id ID` as the Podman name; omitted IDs are generated.
+
 > [!NOTE]
 > `create` and later `start` must use the same `--state-root`; the default is `$XDG_RUNTIME_DIR/guardian`.
 
@@ -45,29 +47,28 @@ Each sandbox has one foreground `start` owner and zero or more concurrent `exec`
 commands. In one terminal:
 
 ```sh
-id=$(guardian create guardian-demo)
-guardian start "$id"
+guardian create --id agent guardian-demo
+guardian start agent
 ```
 
 While that owner is running, another terminal can execute commands:
 
 ```sh
-guardian exec "$id" curl https://example.com
-guardian exec -t "$id" bash
-guardian status "$id"
+guardian exec agent curl https://example.com
+guardian exec -t agent bash
+guardian status agent
 ```
 
 Interrupt `guardian start` to stop the sandbox, then remove it with
-`guardian remove "$id"`.
+`guardian remove agent`.
 
 Some useful options:
 - Pass `--network=<open|none>` to enable/disable Unix domain socket based networking.
-- Pass `--ephemeral` (default to true) to `run` to remove its sandbox after the command exits.
+- `run` removes its sandbox by default; pass `--ephemeral=false` to retain it.
 - Command stdin, stdout, and stderr are inherited. Pass `-t`/`--tty` to
   allocate a guest terminal.
 - For `exec` and `run`, pass `--env KEY=VALUE` (repeatable) and
   `--workdir /guest/path` before the command for per-command overrides.
-- Pass `--name NAME` to `create` or `run` to specify exact Podman container name.
 - Pass `--mount SPEC` repeatedly to forward Podman mount specifications at sandbox creation. For example, `--mount type=bind,source=./workspace,destination=/workspace` persists guest writes in `./workspace`.
 - Pass `--volume SPEC` repeatedly to forward Podman volume specifications at sandbox creation. For example, `--volume ./workspace:/workspace` persists guest writes in `./workspace`.
 - Pass `--gvisor-overlay2 VALUE` to configure gVisor's filesystem overlay; it defaults to `root:self`.

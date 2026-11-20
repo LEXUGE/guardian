@@ -8,7 +8,6 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use guardian::{Error, Result, net::policy::Policy, rt::podman};
-use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -129,13 +128,20 @@ pub enum Command {
         egress: EgressArgs,
 
         /// Remove the sandbox after the command exits.
-        #[arg(long, default_value_t = true)]
+        #[arg(
+            long,
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true
+        )]
         ephemeral: bool,
     },
 
     /// Start a sandbox and own it until interrupted.
     Start {
-        id: Uuid,
+        id: String,
 
         #[command(flatten)]
         egress: EgressArgs,
@@ -143,20 +149,20 @@ pub enum Command {
 
     /// Execute one command in a running sandbox.
     Exec {
-        id: Uuid,
+        id: String,
 
         #[command(flatten)]
         exec: ExecArgs,
     },
 
     /// Print sandbox status.
-    Status { id: Uuid },
+    Status { id: String },
 
     /// Force-stop a sandbox.
-    Kill { id: Uuid },
+    Kill { id: String },
 
     /// Delete a sandbox.
-    Remove { id: Uuid },
+    Remove { id: String },
 
     /// List Guardian-managed containers as JSON.
     List,
@@ -208,9 +214,9 @@ impl EgressArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct CreateArgs {
-    /// Podman container name. Defaults to guardian-UUID.
+    /// Sandbox ID and Podman container name. Generated when omitted.
     #[arg(long)]
-    pub name: Option<String>,
+    pub id: Option<String>,
 
     /// Podman mount specification. May be repeated.
     #[arg(long = "mount", value_name = "TYPE-SPECIFIC-OPTIONS")]
@@ -293,7 +299,7 @@ fn parse_workdir(value: &str) -> std::result::Result<String, String> {
 impl CreateArgs {
     pub fn into_spec(self) -> podman::Spec {
         podman::Spec {
-            name: self.name,
+            id: self.id,
             mounts: self.mounts,
             volumes: self.volumes,
             image: self.image,
@@ -308,26 +314,38 @@ impl CreateArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn explicit_command_replaces_default() {
-        let cli = Cli::try_parse_from(["guardian", "run", "image", "echo", "hello"]).unwrap();
-        let Command::Run { exec, .. } = cli.command else {
+        let cli = Cli::try_parse_from([
+            "guardian",
+            "run",
+            "--id",
+            "agent",
+            "--ephemeral=false",
+            "image",
+            "echo",
+            "hello",
+        ])
+        .unwrap();
+        let Command::Run {
+            create,
+            exec,
+            ephemeral,
+            ..
+        } = cli.command
+        else {
             panic!("expected run command");
         };
+        assert_eq!(create.into_spec().id.as_deref(), Some("agent"));
+        assert!(!ephemeral);
         assert_eq!(exec.command, ["echo", "hello"]);
     }
 
     #[test]
     fn tty_is_an_exec_option() {
-        let cli = Cli::try_parse_from([
-            "guardian",
-            "exec",
-            "00000000-0000-0000-0000-000000000001",
-            "-t",
-            "bash",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["guardian", "exec", "agent", "-t", "bash"]).unwrap();
         let Command::Exec { exec, .. } = cli.command else {
             panic!("expected exec command");
         };
@@ -340,7 +358,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "guardian",
             "exec",
-            "00000000-0000-0000-0000-000000000001",
+            "agent",
             "--env",
             "HOME=/home/agent",
             "--env",
@@ -367,14 +385,8 @@ mod tests {
             ("--workdir", "workspace"),
             ("--workdir", ""),
         ] {
-            let error = Cli::try_parse_from([
-                "guardian",
-                "exec",
-                "00000000-0000-0000-0000-000000000001",
-                option,
-                value,
-            ])
-            .unwrap_err();
+            let error =
+                Cli::try_parse_from(["guardian", "exec", "agent", option, value]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
         }
     }
@@ -429,17 +441,20 @@ mod tests {
 
     #[test]
     fn network_accepts_none_and_defaults_to_open() {
-        let default = Cli::try_parse_from(["guardian", "create", "image"]).unwrap();
-        let Command::Create(default) = default.command else {
+        let default =
+            Cli::try_parse_from(["guardian", "create", "--id", "agent", "image"]).unwrap();
+        let Command::Create(create) = default.command else {
             panic!("expected create command");
         };
-        assert_eq!(default.network, podman::HostUds::Open);
+        let spec = create.into_spec();
+        assert_eq!(spec.id.as_deref(), Some("agent"));
+        assert_eq!(spec.host_uds, podman::HostUds::Open);
 
         let none = Cli::try_parse_from(["guardian", "create", "--network=none", "image"]).unwrap();
-        let Command::Create(none) = none.command else {
+        let Command::Create(create) = none.command else {
             panic!("expected create command");
         };
-        assert_eq!(none.network, podman::HostUds::None);
+        assert_eq!(create.network, podman::HostUds::None);
     }
 
     #[test]
@@ -455,26 +470,6 @@ mod tests {
         assert!(error.to_string().contains("socket path is not absolute"));
     }
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("guardian-cli-{}", Uuid::new_v4()));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).unwrap();
-        }
-    }
-
     fn into_policy(paths: impl IntoIterator<Item = PathBuf>) -> Result<Policy> {
         EgressArgs {
             net_policy: paths.into_iter().collect(),
@@ -484,7 +479,7 @@ mod tests {
 
     #[test]
     fn selects_first_successful_policy() {
-        let dir = TempDir::new();
+        let dir = TempDir::new().unwrap();
         let file1 = dir.path().join("file1");
         let file2 = dir.path().join("file2");
         let file3 = dir.path().join("file3");
@@ -502,7 +497,7 @@ mod tests {
 
     #[test]
     fn selects_default_after_unsuccessful_policies() {
-        let dir = TempDir::new();
+        let dir = TempDir::new().unwrap();
         let file1 = dir.path().join("file1");
         let file2 = dir.path().join("file2");
         // file1 exists but contains malformed TOML.
@@ -516,7 +511,7 @@ mod tests {
 
     #[test]
     fn returns_error_when_no_policy_succeeds() {
-        let dir = TempDir::new();
+        let dir = TempDir::new().unwrap();
         let file1 = dir.path().join("file1");
         let file2 = dir.path().join("file2");
         // file1 exists but contains malformed TOML.
